@@ -1,0 +1,37 @@
+# Job Matching AI Agent — Decision Graph Configuration
+# Can override .env values at runtime
+
+llm:
+  model: qwen3.5-plus
+  temperature: 0.1
+  max_tokens: 4096
+
+embedding:
+  provider: openai          # openai | sentence-transformers
+  model: text-embedding-v3
+
+crawl:
+  use_playwright: true
+  timeout: 30
+  max_urls: 20
+
+matching:
+  # ── 3-dimension weights ──────────────────────────────────────────
+  semantic_weight: 0.3      # embedding similarity
+  llm_weight: 0.4           # LLM reasoning
+  overlap_weight: 0.3       # keyword overlap
+  use_llm: true
+  use_embedding: true
+
+  # ── 2-stage ranking ──────────────────────────────────────────────
+  two_stage: true           # enable 2-stage (embedding → LLM rerank)
+  stage1_top_k: 10          # min candidates passing embedding filter
+  stage1_top_ratio: 0.2     # top fraction passing (whichever is larger)
+  stage1_min_score: 0.3     # embedding score floor
+
+routing:
+  resume_min_skills: 3      # min skills on resume
+  jobs_min_count: 1         # min jobs to proceed
+  max_recrawl: 1            # max recrawl iterations
+
+debug: false

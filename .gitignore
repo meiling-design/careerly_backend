@@ -1,0 +1,32 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual Env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime Data
+app/data/uploads/*
+app/data/outputs/*
+
+# Keep folders
+!app/data/uploads/.gitkeep
+!app/data/outputs/.gitkeep
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

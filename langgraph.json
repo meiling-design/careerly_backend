@@ -1,0 +1,39 @@
+{
+  "name": "Job Matching AI Agent",
+  "description": "Multi-agent job matching system with LangGraph orchestration",
+  "version": "1.0.0",
+  "agents": [
+    {
+      "name": "crawl_agent",
+      "description": "Web crawler for job listings",
+      "module": "app.agents.crawl_agent",
+      "class": "CrawlAgent"
+    },
+    {
+      "name": "resume_agent",
+      "description": "Resume PDF/DOCX parser",
+      "module": "app.agents.resume_agent",
+      "class": "ResumeAgent"
+    },
+    {
+      "name": "matching_agent",
+      "description": "Core matching engine with LLM + embedding",
+      "module": "app.agents.matching_agent",
+      "class": "MatchingAgent"
+    },
+    {
+      "name": "ranking_agent",
+      "description": "Ranking and report export agent",
+      "module": "app.agents.ranking_agent",
+      "class": "RankingAgent"
+    }
+  ],
+  "graphs": [
+    {
+      "name": "job_matching_pipeline",
+      "description": "Full pipeline: crawl → resume → match → rank",
+      "orchestrator": "app.core.orchestrator",
+      "entry": "JobMatchingOrchestrator.run"
+    }
+  ]
+}

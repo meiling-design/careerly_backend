@@ -26,7 +26,10 @@ MATCH_OUTPUT_DIR = DATA_DIR / "outputs"
 
 
 class MatchingAgent:
-    """Core matching engine — 2-stage: embedding filter → LLM rerank."""
+    """Core matching engine — 2-stage: embedding filter → LLM rerank.
+
+    Supports both per-job LLM scoring and ⭐ batch LLM scoring.
+    """
 
     def __init__(
         self,
@@ -39,6 +42,9 @@ class MatchingAgent:
         stage1_top_k: int = 10,
         stage1_top_ratio: float = 0.2,
         stage1_min_score: float = 0.3,
+        # ⭐ Batch LLM
+        use_batch_llm: bool = True,
+        batch_min_jobs: int = 3,
     ):
         self.llm = llm or LLMService()
         self.embedder = embedder or EmbeddingService()
@@ -48,6 +54,9 @@ class MatchingAgent:
         self.stage1_top_k = stage1_top_k
         self.stage1_top_ratio = stage1_top_ratio
         self.stage1_min_score = stage1_min_score
+        # ⭐ Batch LLM
+        self.use_batch_llm = use_batch_llm
+        self.batch_min_jobs = batch_min_jobs
         self.session_id: str = ""
         MATCH_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -64,6 +73,8 @@ class MatchingAgent:
         # Optional pre-computed embeddings (from cache)
         resume_embedding: Optional[list[float]] = None,
         job_embeddings: Optional[list[list[float]]] = None,
+        # ⭐ Batch LLM
+        use_batch_llm: Optional[bool] = None,
     ) -> list[MatchResult]:
         """Match resume against jobs. Supports single-pass or 2-stage.
 
@@ -76,14 +87,16 @@ class MatchingAgent:
             session_id: Traceability ID.
             resume_embedding: Pre-computed resume embedding (from cache).
             job_embeddings: Pre-computed job embeddings (from cache).
+            use_batch_llm: Enable batch LLM scoring (multiple jobs per API call).
 
         Returns:
             Sorted list of MatchResults (highest score first).
         """
         self.session_id = session_id or f"match-{uuid.uuid4().hex[:8]}"
+        batch = use_batch_llm if use_batch_llm is not None else self.use_batch_llm
         logger.info(
-            "MatchingAgent starting | resume=%s | jobs=%d | two_stage=%s",
-            resume.name, jobs.total_count, two_stage,
+            "MatchingAgent starting | resume=%s | jobs=%d | two_stage=%s | batch_llm=%s",
+            resume.name, jobs.total_count, two_stage, batch,
         )
 
         if not jobs.jobs:
@@ -91,6 +104,12 @@ class MatchingAgent:
             return []
 
         if two_stage and use_embedding and len(jobs.jobs) > self.stage1_top_k:
+            # ⭐ Use batch LLM when enabled AND enough candidates
+            if batch and use_llm and len(jobs.jobs) >= self.batch_min_jobs:
+                return await self._run_two_stage_batch(
+                    resume, jobs, use_llm,
+                    resume_embedding, job_embeddings,
+                )
             return await self._run_two_stage(
                 resume, jobs, use_llm,
                 resume_embedding, job_embeddings,
@@ -169,6 +188,140 @@ class MatchingAgent:
         logger.info(
             "MatchingAgent 2-stage done | passed=%d | top=%.3f",
             passed, results[0].score if results else 0,
+        )
+        return results
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  ⭐ Batch 2-Stage: embedding filter → batch LLM (single API call)
+    # ═════════════════════════════════════════════════════════════════════
+
+    async def _run_two_stage_batch(
+        self,
+        resume: ResumeProfile,
+        jobs: JobList,
+        use_llm: bool,
+        resume_embedding: Optional[list[float]],
+        job_embeddings: Optional[list[list[float]]],
+    ) -> list[MatchResult]:
+        """2-Stage with batch LLM: embedding filter → one batch LLM call for all candidates.
+
+        Cost: 1 LLM API call instead of N (saves ~70-90%).
+        """
+        resume_text = self._resume_for_prompt(resume)
+
+        # ═══ Stage 1: Embedding filter (same as before) ═══════════════════
+        logger.info("Stage 1 (batch): Embedding filter on %d jobs", len(jobs.jobs))
+
+        if resume_embedding is None:
+            resume_emb = self.embedder.embed(resume_text)
+        else:
+            resume_emb = resume_embedding
+
+        if job_embeddings is None:
+            job_texts = [j.description[:3000] or j.title for j in jobs.jobs]
+            job_embs = self.embedder.embed_many(job_texts)
+        else:
+            job_embs = job_embeddings
+
+        top_candidates = self.embedder.filter_top_k(
+            target_embedding=resume_emb,
+            candidate_embeddings=job_embs,
+            k=self.stage1_top_k,
+            ratio=self.stage1_top_ratio,
+            min_score=self.stage1_min_score,
+        )
+
+        passed = len(top_candidates)
+        logger.info("Stage 1 (batch) filter: %d/%d passed", passed, len(jobs.jobs))
+
+        if not top_candidates:
+            logger.warning("Stage 1 filter returned zero — using top %d by index", self.stage1_top_k)
+            top_candidates = [(i, 0.0) for i in range(min(self.stage1_top_k, len(jobs.jobs)))]
+            passed = len(top_candidates)
+
+        # ═══ Stage 2: Batch LLM call (1 API call for ALL candidates) ════
+        logger.info("Stage 2 (batch): Batch LLM scoring %d candidates in 1 call", passed)
+        batch_jobs = [
+            {
+                "job_index": job_idx,
+                "title": jobs.jobs[job_idx].title,
+                "company": jobs.jobs[job_idx].company or "",
+                "description": (jobs.jobs[job_idx].description or "")[:3000],
+                "required_skills": jobs.jobs[job_idx].required_skills or [],
+            }
+            for job_idx, _ in top_candidates
+        ]
+
+        batch_results: list[dict] = []
+        if use_llm and batch_jobs:
+            try:
+                batch_results = self.llm.batch_match(resume_text, batch_jobs)
+                logger.info("Batch LLM returned %d results", len(batch_results))
+            except Exception as e:
+                logger.error("Batch LLM failed, falling back to per-job: %s", e)
+                # Fall back to individual calls
+                return await self._run_two_stage(
+                    resume, jobs, use_llm,
+                    resume_embedding, job_embeddings,
+                )
+
+        # Build result index from batch response
+        batch_by_index: dict[int, dict] = {}
+        for br in batch_results:
+            idx = br.get("job_index")
+            if idx is not None:
+                batch_by_index[int(idx)] = br
+
+        # ═══ Combine: batch LLM scores + local overlap + semantic ═══════
+        results: list[MatchResult] = []
+        for job_idx, sem_score in top_candidates:
+            job = jobs.jobs[job_idx]
+            try:
+                # 1. Local skill overlap (fast, no API call)
+                overlap = self._skill_overlap(resume.skills, job.required_skills)
+                overlap_score = overlap["score"]
+
+                # 2. Batch LLM result (if available)
+                batch_result = batch_by_index.get(job_idx, {})
+                llm_score = float(batch_result.get("score", 0.5)) if batch_result else 0.5
+                gaps_raw = batch_result.get("gaps", [])
+                match_reasons = batch_result.get("match_reasons", overlap["reasons"])
+                missing_skills = batch_result.get("missing_skills", overlap["missing"])
+                recommendations = batch_result.get("recommendations", [])
+
+                # 3. Composite score
+                composite = self._composite_score(overlap_score, sem_score, llm_score)
+
+                results.append(MatchResult(
+                    job=job,
+                    score=round(composite, 4),
+                    skill_overlap=overlap["matched"],
+                    missing_skills=missing_skills,
+                    partial_skills=batch_result.get("partial_skills", []),
+                    match_reasons=match_reasons,
+                    gaps=[
+                        SkillGap(
+                            skill=g.get("skill", g) if isinstance(g, str) else g.get("skill", "Unknown"),
+                            severity=g.get("severity", "missing") if isinstance(g, dict) else "missing",
+                            suggestion=g.get("suggestion") if isinstance(g, dict) else None,
+                        )
+                        for g in gaps_raw
+                    ],
+                    semantic_score=round(sem_score, 4) if sem_score is not None else None,
+                    llm_score=round(llm_score, 4),
+                    recommendations=recommendations,
+                ))
+                logger.debug("Batch | %s → %.3f (sem=%.3f, llm=%.3f)", job.title, composite, sem_score, llm_score)
+            except Exception as e:
+                logger.error("Batch result build failed for '%s': %s", job.title, e)
+                results.append(self._fallback_result(job))
+                continue
+
+        results.sort(key=lambda r: r.score, reverse=True)
+        self._save_checkpoint(results)
+        logger.info(
+            "MatchingAgent batch done | passed=%d | top=%.3f | api_calls=1 (was %d)",
+            passed, results[0].score if results else 0, passed,
         )
         return results
 

@@ -134,6 +134,28 @@ class StateStore:
         )
         conn.commit()
 
+    def list_sessions(self, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        """List recent sessions with metadata."""
+        conn = _get_conn(self.db_path)
+        rows = conn.execute(
+            "SELECT session_id, status, config_json, created_at, updated_at, error_json "
+            "FROM sessions ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            cfg = json.loads(row["config_json"]) if row["config_json"] else {}
+            errors_list = json.loads(row["error_json"]) if row["error_json"] else []
+            results.append({
+                "session_id": row["session_id"],
+                "status": row["status"],
+                "config": cfg,
+                "error_count": len(errors_list),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            })
+        return results
+
     # ── Jobs ────────────────────────────────────────────────────────────
 
     def save_jobs(self, session_id: str, job_list: JobList) -> None:
@@ -351,3 +373,90 @@ class StateStore:
             "logs": self.load_logs(session_id),
             "errors": self.load_errors(session_id),
         }
+
+    # ── Session info ────────────────────────────────────────────────────
+
+    def get_session_info(self, session_id: str) -> dict[str, Any] | None:
+        """Return session metadata (status, config, timestamps) or None."""
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT session_id, status, config_json, created_at, updated_at, error_json "
+            "FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "session_id": row["session_id"],
+            "status": row["status"],
+            "config": json.loads(row["config_json"]) if row["config_json"] else {},
+            "errors": json.loads(row["error_json"]) if row["error_json"] else [],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    # ── GraphState restoration (session resume) ─────────────────────────
+
+    def restore_graph_state(self) -> dict[str, Any]:
+        """Build a partial GraphState dict from persisted data.
+
+        Returns an updates dict that can be merged into a fresh GraphState
+        to resume from where a prior run left off.
+        """
+        # This is a placeholder — the caller passes session_id at restore time.
+        # The actual method with session_id parameter is on state_store_ext.
+        pass
+
+
+# ── Helper: reconstruct GraphState from stored session ──────────────────────
+
+
+def restore_session_state(store: StateStore, session_id: str) -> dict[str, Any]:
+    """Load persisted session data and return a dict that can merge into GraphState.
+
+    Usage:
+        store = StateStore()
+        updates = restore_session_state(store, session_id)
+        state = GraphState(**updates)  # plus fresh run params
+    """
+    from app.models.job import JobList
+    from app.models.match import MatchResult
+    from app.models.resume import ResumeProfile
+
+    info = store.get_session_info(session_id)
+    if not info:
+        return {}
+
+    updates: dict[str, Any] = {
+        "session_id": session_id,
+        "errors": list(info["errors"]),
+    }
+
+    # Restore jobs → crawler_output
+    jobs = store.load_jobs(session_id)
+    if jobs:
+        updates["crawler_output"] = jobs
+        updates["normalized_jobs"] = jobs
+
+    # Restore resume
+    resume = store.load_resume(session_id)
+    if resume:
+        updates["resume_output"] = resume
+
+    # Restore match_results
+    match_results = store.load_match_results(session_id)
+    if match_results:
+        updates["match_results"] = match_results
+
+    # Restore config flags from session metadata
+    cfg = info.get("config", {})
+    if isinstance(cfg, dict):
+        updates["use_llm"] = cfg.get("use_llm", True)
+        updates["use_embedding"] = cfg.get("use_embedding", True)
+
+    # Restore logs
+    logs = store.load_logs(session_id)
+    if logs:
+        updates["progress_log"] = logs
+
+    return updates

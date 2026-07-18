@@ -39,6 +39,12 @@ class GraphState:
 
     # ── Input ────────────────────────────────────────────────────────────
     job_urls: list[str] = field(default_factory=list)
+    """URLs to crawl for job postings."""
+
+    manual_job_texts: list[str] = field(default_factory=list)
+    """Manually pasted job descriptions (for sites like Boss直聘 that block crawlers).
+       Each entry is one full JD text, processed directly without crawling."""
+
     resume_file_path: Optional[str] = None
     resume_text: Optional[str] = None
     session_id: Optional[str] = None
@@ -63,10 +69,20 @@ class GraphState:
 
     # ── Routing decision ─────────────────────────────────────────────────
     routing_decision: str = ""
-    """What the Routing Node decided: 'match' | 'recrawl' | 'skip' | 'end'."""
+    """What the Routing Node decided: 'match' | 'recrawl' | 'refine_crawl' | 'ask_user' | 'end'."""
 
     routing_reason: str = ""
     """Why the routing decision was made."""
+
+    routing_confidence: float = 0.0
+    """LLM Router's confidence in its decision (0-1)."""
+
+    router_llm_used: bool = False
+    """Whether the LLM Router made the decision (vs rule fallback)."""
+
+    # ── Refine crawl flag ──────────────────────────────────────────────────
+    refine_crawl_mode: str = ""
+    """When routing='refine_crawl', specific strategy: 'use_playwright' | 'parse_differently' | 'try_alternate_source'."""
 
     # ── 2-stage matching: Stage 1 (embedding filter) ─────────────────────
     stage1_scores: list[dict] = field(default_factory=list)

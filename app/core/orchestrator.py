@@ -48,10 +48,12 @@ from langgraph.graph import END, StateGraph
 from app.agents import CrawlAgent, MatchingAgent, RankingAgent, ResumeAgent
 from app.core.config import AppConfig
 from app.core.state import AgentStatus, GraphState
-from app.core.state_store import StateStore
+from app.core.state_store import StateStore, restore_session_state
 from app.models.job import JobList, JobPosting, JobSource
 from app.models.match import MatchResult
 from app.models.resume import ResumeProfile
+from app.services.embedding_service import EmbeddingService
+from app.services.llm_service import LLMService
 from app.utils.logger import logger
 
 
@@ -66,13 +68,33 @@ class DecisionGraph:
     def __init__(self, config: Optional[AppConfig] = None):
         self.config = config or AppConfig()
 
-        # Agents
+        # Shared services (single instances reused across all agents)
+        self.llm_service = LLMService(
+            model=self.config.llm.model,
+            api_key=self.config.llm.api_key,
+            base_url=self.config.llm.base_url,
+            temperature=self.config.llm.temperature,
+            max_tokens=self.config.llm.max_tokens,
+        )
+        self.embedding_service = EmbeddingService(
+            provider=self.config.embedding.provider,
+            model=self.config.embedding.model,
+            api_key=self.config.embedding.api_key,
+            base_url=self.config.embedding.base_url,
+        )
+
+        # Agents (shared services injected)
         self.crawl_agent = CrawlAgent(
+            llm=self.llm_service,
             use_playwright=self.config.crawl.use_playwright,
             timeout=self.config.crawl.timeout,
         )
-        self.resume_agent = ResumeAgent()
+        self.resume_agent = ResumeAgent(
+            llm=self.llm_service,
+        )
         self.matching_agent = MatchingAgent(
+            llm=self.llm_service,
+            embedder=self.embedding_service,
             semantic_weight=self.config.matching.semantic_weight,
             llm_weight=self.config.matching.llm_weight,
             overlap_weight=self.config.matching.overlap_weight,
@@ -88,6 +110,9 @@ class DecisionGraph:
         # Callbacks
         self.on_progress: Optional[Callable[[str], None]] = None
         self.on_status_change: Optional[Callable[[str, str], None]] = None
+
+        # Current graph state (set at start of each node for _emit logging)
+        self._current_state: Optional[GraphState] = None
 
         # Compiled graph (built lazily)
         self._graph: Optional[Any] = None
@@ -125,6 +150,8 @@ class DecisionGraph:
             {
                 "match": "match",
                 "recrawl": "recrawl",
+                "refine_crawl": "recrawl",    # ⭐ 新增: 用不同策略重抓
+                "ask_user": END,               # ⭐ 新增: 需要人工介入
                 "end": END,
             },
         )
@@ -149,45 +176,91 @@ class DecisionGraph:
     # ═════════════════════════════════════════════════════════════════════
 
     async def _node_crawl(self, state: GraphState) -> dict:
-        """CrawlNode: Fetch and parse job listings from URLs."""
-        updates: dict[str, Any] = {}
+        """CrawlNode: Process manual job texts + crawl URLs.
+
+        Two sources of job data:
+          1. manual_job_texts — user-pasted JD text (Boss直聘等受限站点)
+          2. job_urls — crawlable URLs (腾讯、字节等)
+        Results are merged into a single JobList.
+        """
+        self._current_state = state
         self._update_status(state, "crawl", "running")
-        self._emit("🔍 Node 1/8: Crawling %d URLs..." % len(state.job_urls))
 
-        if not state.job_urls:
-            self._emit("⚠️ No job URLs, skipping crawl")
-            self._update_status(state, "crawl", "skipped")
-            return {"crawler_output": None}
+        has_manual = bool(state.manual_job_texts)
+        has_urls = bool(state.job_urls)
+        sources = []
+        if has_manual:
+            sources.append("%d manual" % len(state.manual_job_texts))
+        if has_urls:
+            sources.append("%d URLs" % len(state.job_urls))
 
-        max_retries = 2
-        for attempt in range(1, max_retries + 1):
-            try:
-                job_list = await self.crawl_agent.run(
-                    urls=state.job_urls,
-                    use_llm=state.use_llm,
-                    session_id=state.session_id,
+        source_label = " + ".join(sources) if sources else "nothing"
+        self._emit("🔍 Node 1/8: Processing %s..." % source_label)
+
+        job_list = JobList(session_id=state.session_id)
+
+        # ── Step 1: Process manually pasted job descriptions ────────────
+        if has_manual:
+            self._emit("📝 Processing %d manually pasted JD(s)..." % len(state.manual_job_texts))
+            for i, text in enumerate(state.manual_job_texts):
+                text = text.strip()
+                if not text:
+                    continue
+                job = JobPosting(
+                    title="[手动输入] 职位 #%d" % (i + 1),
+                    description=text,
+                    source=JobSource.MANUAL,
+                    url=None,
+                    company=None,
+                    crawled_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
                 )
-                self._update_status(state, "crawl", "completed")
-                self._emit("✅ Crawl complete: %d jobs from %d URLs" % (job_list.total_count, len(state.job_urls)))
+                job_list.add(job)
+            self._emit("✅ Added %d manual JD(s)" % job_list.total_count)
 
-                # Persist to SQLite
-                self.store.save_state(state.session_id, jobs=job_list)
+        # ── Step 2: Crawl job URLs ─────────────────────────────────────
+        if has_urls:
+            max_retries = 2
+            for attempt in range(1, max_retries + 1):
+                try:
+                    crawled = await self.crawl_agent.run(
+                        urls=state.job_urls,
+                        use_llm=state.use_llm,
+                        session_id=state.session_id,
+                    )
+                    # Merge crawled jobs into job_list
+                    for j in crawled.jobs:
+                        job_list.add(j)
+                    self._emit("✅ Crawl: %d jobs from %d URLs" % (crawled.total_count, len(state.job_urls)))
+                    break
+                except Exception as e:
+                    logger.warning("Crawl attempt %d/%d failed: %s", attempt, max_retries, e)
+                    if attempt < max_retries:
+                        await asyncio.sleep(2 ** attempt)
+                        self._emit("🔄 Retry crawl (%d/%d)..." % (attempt, max_retries))
+                    else:
+                        self._emit("⚠️ URL crawl exhausted after %d attempts" % max_retries)
+                        # Non-fatal: manual JDs may still exist
 
-                return {"crawler_output": job_list}
-            except Exception as e:
-                logger.warning("Crawl attempt %d/%d failed: %s", attempt, max_retries, e)
-                if attempt < max_retries:
-                    await asyncio.sleep(2 ** attempt)
-                    self._emit("🔄 Retry crawl (%d/%d)..." % (attempt, max_retries))
-                else:
-                    self._update_status(state, "crawl", "failed", str(e))
-                    self._emit("❌ Crawl failed: %s" % e)
-                    return {"errors": state.errors + [str(e)], "crawler_output": None}
+        # ── Finalize ────────────────────────────────────────────────────
+        if job_list.total_count == 0:
+            self._emit("⚠️ No jobs from either manual input or URL crawl")
+            self._update_status(state, "crawl", "completed")
+            # Return a valid empty JobList so routing can decide recrawl/end
+            self.store.save_state(state.session_id, jobs=job_list)
+            return {"crawler_output": job_list}
 
-        return {}
+        job_list.deduplicate()
+        self._update_status(state, "crawl", "completed")
+        self._emit("✅ CrawlNode complete: %d total jobs (%s)" % (job_list.total_count, source_label))
+
+        # Persist to SQLite
+        self.store.save_state(state.session_id, jobs=job_list)
+
+        return {"crawler_output": job_list}
 
     async def _node_normalize(self, state: GraphState) -> dict:
         """NormalizeNode: Enhance raw job data with LLM parsing (skills, etc.)."""
+        self._current_state = state
         self._update_status(state, "normalize", "running")
         self._emit("⚙️  Node 2/8: Normalizing job data...")
 
@@ -210,10 +283,10 @@ class DecisionGraph:
                 try:
                     parsed = self.crawl_agent.llm.parse_job(job.description[:4000])
                     enriched = JobPosting(
-                        title=job.title,
+                        title=parsed.get("title") or job.title,
                         description=job.description,
                         url=job.url,
-                        company=job.company,
+                        company=parsed.get("company") or job.company,
                         location=job.location,
                         source=job.source,
                         crawled_at=job.crawled_at,
@@ -240,6 +313,7 @@ class DecisionGraph:
         If resume is not yet parsed, parse it first.
         Then compute and cache the resume embedding.
         """
+        self._current_state = state
         updates: dict[str, Any] = {}
         self._update_status(state, "resume_embed", "running")
         self._emit("📄 Node 3/8: Parsing resume & computing embeddings...")
@@ -257,7 +331,8 @@ class DecisionGraph:
                     session_id=state.session_id,
                 )
                 resume = parsed
-                resume_raw = parsed.raw_text or state.resume_text or ""
+                # Store raw text for embedding and LLM downstream use
+                updates["resume_raw_text"] = parsed.raw_text or state.resume_text or ""
                 updates["resume_output"] = parsed
                 updates["resume_raw_text"] = resume_raw
                 self.store.save_state(state.session_id, resume=parsed)
@@ -298,72 +373,191 @@ class DecisionGraph:
         return updates
 
     async def _node_routing(self, state: GraphState) -> dict:
-        """RoutingNode (⭐关键): Decide whether to match, recrawl, or end.
+        """RoutingNode (⭐关键): LLM + Rule Hybrid Router.
 
-        Decision logic:
-          - No jobs at all              → "end"
-          - No resume                   → "end" (can't match without profile)
-          - Jobs empty after crawl      → "recrawl" (if retries remain)
-          - Resume has too few skills   → "match" anyway (use raw text)
-          - Jobs + resume ready         → "match"
+        Step 1: Collect data quality signals.
+        Step 2: If LLM router enabled, ask LLM for decision with confidence.
+        Step 3: If LLM unavailable or confidence < threshold → fall back to rules.
+        Step 4: Return decision with reason and (optionally) refine strategy.
         """
+        self._current_state = state
         self._update_status(state, "routing", "running")
-        self._emit("🧭 Node 4/8: Routing decision...")
-
-        decision = "match"
-        reason = ""
+        self._emit("🧭 Node 4/8: Hybrid routing decision...")
 
         jobs = state.normalized_jobs or state.crawler_output
         resume = state.resume_output
 
-        # Case 1: No resume
-        if not resume:
-            decision = "end"
-            reason = "No resume data available — cannot match"
-            self._emit("❌ " + reason)
+        # ═══ Step 1: Collect quality signals ═══════════════════════════════
+        total_jobs = jobs.total_count if jobs else 0
+        total_urls = len(state.job_urls) if state.job_urls else 0
+        resume_exists = resume is not None
+        resume_skills = len(resume.skills) if resume else 0
+        resume_has_raw = bool(resume and resume.raw_text)
+        errors_list = state.errors or []
+        fatal_errors = [e for e in errors_list if "fatal" in e.lower() or "critical" in e.lower()]
 
-        # Case 2: No jobs at all
-        elif not jobs or not jobs.jobs:
-            if state.recrawl_count < state.max_recrawl:
-                decision = "recrawl"
-                reason = "No jobs found — attempting recrawl"
-                self._emit("🔄 " + reason)
+        # Compute job quality signals
+        avg_job_desc_length = 0
+        avg_skills_per_job = 0
+        if jobs and jobs.jobs:
+            descs = [len(j.description or "") for j in jobs.jobs]
+            avg_job_desc_length = int(sum(descs) / len(descs)) if descs else 0
+            avg_skills_per_job = int(sum(len(j.required_skills or []) for j in jobs.jobs) / len(jobs.jobs)) if jobs.jobs else 0
+
+        quality_signals = {
+            "total_urls": total_urls,
+            "total_jobs": total_jobs,
+            "avg_job_desc_length": avg_job_desc_length,
+            "avg_skills_per_job": avg_skills_per_job,
+            "resume_exists": resume_exists,
+            "resume_skills_count": resume_skills,
+            "resume_has_raw_text": resume_has_raw,
+            "crawl_error_count": len(errors_list),
+            "fatal_errors": len(fatal_errors) > 0,
+            "recrawl_remaining": max(0, state.max_recrawl - state.recrawl_count),
+            "use_llm": state.use_llm,
+        }
+
+        # ═══ Step 2: Try LLM Router ═══════════════════════════════════════
+        llm_decision = None
+        if self.config.routing.use_llm_router and state.use_llm:
+            try:
+                llm_decision = self.matching_agent.llm.route(quality_signals)
+                self._emit("🤖 LLM Router → %s (conf=%.2f)" % (
+                    llm_decision.get("next_action", "?"),
+                    llm_decision.get("confidence", 0),
+                ))
+            except Exception as e:
+                logger.warning("LLM Router failed, falling back to rules: %s", e)
+                llm_decision = None
+
+        # ═══ Step 3: Validate LLM decision vs rules ═══════════════════════
+        decision = "match"
+        reason = ""
+        confidence = 0.0
+        used_llm = False
+
+        if llm_decision:
+            llm_action = llm_decision.get("next_action", "match")
+            llm_conf = float(llm_decision.get("confidence", 0))
+            threshold = self.config.routing.llm_confidence_threshold
+
+            # Cross-check with basic rules
+            rule_says = self._rule_based_decision(
+                resume_exists=resume_exists,
+                resume_skills=resume_skills,
+                total_jobs=total_jobs,
+                fatal_errors=bool(fatal_errors),
+                recrawl_remaining=quality_signals["recrawl_remaining"],
+                max_recrawl=state.max_recrawl,
+            )
+
+            # Accept LLM if confidence >= threshold AND doesn't violate critical rules
+            if llm_conf >= threshold:
+                # Critical rule override: no resume → end
+                if llm_action != "end" and not resume_exists:
+                    decision = "end"
+                    reason = "LLM suggested %s but no resume exists — forced end" % llm_action
+                    confidence = 1.0
+                    used_llm = False
+                # Critical rule override: fatal errors + !end → end
+                elif llm_action != "end" and fatal_errors:
+                    decision = "end"
+                    reason = "LLM suggested %s but fatal errors exist — forced end" % llm_action
+                    confidence = 1.0
+                    used_llm = False
+                else:
+                    decision = llm_action
+                    reason = llm_decision.get("reason", "LLM Router decision")
+                    confidence = llm_conf
+                    used_llm = True
+                    self._emit("✅ LLM Router accepted: %s (conf=%.2f)" % (decision, confidence))
             else:
-                decision = "end"
-                reason = "No jobs found after %d recrawl(s)" % state.recrawl_count
-                self._emit("❌ " + reason)
-
-        # Case 3: Resume has very few skills (low quality)
-        elif resume and len(resume.skills) < self.config.routing.resume_min_skills:
-            reason = "Resume has only %d skills — will match using raw text" % len(resume.skills)
-            self._emit("⚠️ " + reason)
-            decision = "match"  # still proceed, just warn
-
-        # Case 4: Everything ready
+                # LLM confidence too low → use rule fallback
+                self._emit("⚠️ LLM Router confidence too low (%.2f < %.2f), using rules" % (llm_conf, threshold))
+                decision = rule_says["decision"]
+                reason = rule_says["reason"]
+                confidence = 0.5
+                used_llm = False
         else:
-            job_count = jobs.total_count
-            skill_count = len(resume.skills) if resume else 0
-            reason = "%d jobs × %d skills — proceeding to matching" % (job_count, skill_count)
-            self._emit("✅ " + reason)
-            decision = "match"
+            # ═══ Step 4: Pure rule fallback ════════════════════════════════
+            rule_result = self._rule_based_decision(
+                resume_exists=resume_exists,
+                resume_skills=resume_skills,
+                total_jobs=total_jobs,
+                fatal_errors=bool(fatal_errors),
+                recrawl_remaining=quality_signals["recrawl_remaining"],
+                max_recrawl=state.max_recrawl,
+            )
+            decision = rule_result["decision"]
+            reason = rule_result["reason"]
+            confidence = 1.0
+            used_llm = False
 
-        logger.info("Routing decision: %s | %s", decision, reason)
+        # ═══ Emit result ═══════════════════════════════════════════════════
+        decision_cn = {"match": "匹配", "recrawl": "重抓", "refine_crawl": "优化重抓", "ask_user": "人工介入", "end": "结束"}.get(decision, decision)
+        self._emit("🧭 路由: %s (%s)" % (decision_cn, reason))
+
+        logger.info("Routing decision: %s | conf=%.2f | llm=%s | %s", decision, confidence, used_llm, reason)
         self._update_status(state, "routing", "completed")
-        self.store.append_log(state.session_id, "Routing: %s — %s" % (decision, reason))
+        self.store.append_log(state.session_id, "Routing: %s — %s (conf=%.2f, llm=%s)" % (decision, reason, confidence, used_llm))
 
         return {
             "routing_decision": decision,
             "routing_reason": reason,
+            "routing_confidence": confidence,
+            "router_llm_used": used_llm,
         }
 
+    def _rule_based_decision(
+        self,
+        *,
+        resume_exists: bool,
+        resume_skills: int,
+        total_jobs: int,
+        fatal_errors: bool,
+        recrawl_remaining: int,
+        max_recrawl: int = 1,
+    ) -> dict:
+        """Pure rule-based routing fallback (original if/else logic)."""
+        # Case 1: Fatal errors
+        if fatal_errors:
+            return {"decision": "end", "reason": "存在严重错误 — 终止流程"}
+
+        # Case 2: No resume
+        if not resume_exists:
+            return {"decision": "end", "reason": "无简历数据 — 无法匹配"}
+
+        # Case 3: No jobs with retries remaining
+        if total_jobs == 0 and recrawl_remaining > 0:
+            return {"decision": "recrawl", "reason": "未找到职位 — 尝试重抓"}
+
+        # Case 4: No jobs, no retries
+        if total_jobs == 0 and recrawl_remaining <= 0:
+            return {"decision": "end", "reason": "重试 %d 次后仍无职位 — 终止" % max_recrawl}
+
+        # Case 5: Resume very few skills
+        if resume_skills < 3:
+            return {"decision": "match", "reason": "简历技能仅 %d 项 — 使用原始文本匹配" % resume_skills}
+
+        # Case 6: Everything ready
+        return {"decision": "match", "reason": "%d 个职位 × %d 项技能 — 进入匹配" % (total_jobs, resume_skills)}
+
     async def _node_recrawl(self, state: GraphState) -> dict:
-        """RecrawlNode: Retry failed URLs or try alternative parsing."""
+        """RecrawlNode: Retry failed URLs with different strategy.
+
+        Supports two modes:
+          - "recrawl": Standard retry (same settings, different session).
+          - "refine_crawl": ⭐ Different strategy (Playwright, alternate parsing).
+        """
+        self._current_state = state
+        is_refine = state.routing_decision == "refine_crawl"
+        mode_label = "优化重抓" if is_refine else "重试"
         self._update_status(state, "recrawl", "running")
-        self._emit("🔄 Node 5/8: Recrawling (attempt %d/%d)..." % (
-            state.recrawl_count + 1, state.max_recrawl,
+        self._emit("🔄 Node 5/8: %s (attempt %d/%d)..." % (
+            mode_label, state.recrawl_count + 1, state.max_recrawl,
         ))
 
-        # Try with Playwright if we didn't before, or with different settings
         urls = state.job_urls
         if not urls:
             self._emit("⚠️ No URLs to recrawl")
@@ -371,13 +565,14 @@ class DecisionGraph:
             return {"routing_decision": "end"}
 
         try:
+            # ⭐ Refine mode: use Playwright + full LLM parsing
             job_list = await self.crawl_agent.run(
                 urls=urls,
-                use_llm=state.use_llm,
-                session_id=state.session_id + "-recrawl",
+                use_llm=True,          # always use LLM for refine
+                session_id=state.session_id + ("-refine" if is_refine else "-recrawl"),
             )
             self.store.save_state(state.session_id, jobs=job_list)
-            self._emit("✅ Recrawl found %d jobs" % job_list.total_count)
+            self._emit("✅ %s found %d jobs" % (mode_label, job_list.total_count))
             self._update_status(state, "recrawl", "completed")
             return {
                 "crawler_output": job_list,
@@ -394,6 +589,7 @@ class DecisionGraph:
 
     async def _node_match(self, state: GraphState) -> dict:
         """MatchNode: 2-stage matching — embedding filter → LLM rerank."""
+        self._current_state = state
         self._update_status(state, "match", "running")
 
         jobs = (state.normalized_jobs or state.crawler_output)
@@ -406,7 +602,8 @@ class DecisionGraph:
 
         job_count = jobs.total_count
         two_stage = self.config.matching.two_stage and job_count > self.config.matching.stage1_top_k
-        stage = "2-stage" if two_stage else "full-pass"
+        use_batch = two_stage and job_count >= 3
+        stage = "batch-2-stage" if use_batch else ("2-stage" if two_stage else "full-pass")
 
         self._emit("🧠 Node 6/8: Matching (%s) — %d jobs" % (stage, job_count))
 
@@ -429,6 +626,7 @@ class DecisionGraph:
                 session_id=state.session_id,
                 resume_embedding=resume_emb_cache,
                 job_embeddings=job_emb_cache,
+                use_batch_llm=True,  # ⭐ 启用批量 LLM 评分
             )
 
             # Compute stage1 scores for state tracking
@@ -464,6 +662,7 @@ class DecisionGraph:
 
     async def _node_rank(self, state: GraphState) -> dict:
         """RankNode: Sort and score all match results."""
+        self._current_state = state
         self._update_status(state, "rank", "running")
         self._emit("📊 Node 7/8: Ranking %d results..." % len(state.match_results))
 
@@ -493,6 +692,7 @@ class DecisionGraph:
 
     async def _node_report(self, state: GraphState) -> dict:
         """ReportNode: Generate final report and export files."""
+        self._current_state = state
         self._update_status(state, "report", "running")
         self._emit("📋 Node 8/8: Generating reports & exports...")
 
@@ -507,6 +707,8 @@ class DecisionGraph:
         if not jobs:
             jobs = JobList()
 
+        # Always build a report object — export is best-effort
+        report: Optional[MatchReport] = None
         try:
             report = await self.ranking_agent.run(
                 results=state.match_results,
@@ -528,12 +730,23 @@ class DecisionGraph:
             # Persist final status
             self.store.update_session_status(state.session_id, "completed")
 
-            return {"report": report}
-
         except Exception as e:
-            self._update_status(state, "report", "failed", str(e))
-            self._emit("❌ Report generation failed: %s" % e)
-            return {"errors": state.errors + ["Report failed: %s" % e]}
+            self._emit("⚠️ Export failed (non-fatal): %s" % e)
+            logger.warning("Report export failed, building in-memory report: %s", e)
+            # Build a minimal report from match_results so UI can still display scores
+            if not report:
+                from app.models.match import MatchReport
+                report = MatchReport(
+                    resume=resume,
+                    results=sorted(state.match_results, key=lambda r: r.score, reverse=True),
+                    total_jobs=len(state.match_results),
+                    average_score=round(
+                        sum(r.score for r in state.match_results) / len(state.match_results), 4
+                    ) if state.match_results else 0.0,
+                )
+            self._update_status(state, "report", "completed")
+
+        return {"report": report}
 
     # ═════════════════════════════════════════════════════════════════════
     #  Public entry point
@@ -544,16 +757,23 @@ class DecisionGraph:
         job_urls: list[str],
         resume_file_path: Optional[str] = None,
         resume_text: Optional[str] = None,
+        manual_job_texts: Optional[list[str]] = None,
         session_id: Optional[str] = None,
         use_llm: bool = True,
         use_embedding: bool = True,
     ) -> GraphState:
         """Execute the full decision graph pipeline.
 
+        If session_id points to an existing session with persisted data,
+        the pipeline resumes from where it left off (crawler_output,
+        resume, match_results are restored from the store).
+
         Args:
             job_urls: Job posting URLs to analyze.
             resume_file_path: Path to resume file.
             resume_text: Raw resume text (alternative).
+            manual_job_texts: Manually pasted job descriptions (for sites
+                              like Boss直聘 that block crawlers).
             session_id: Optional traceability ID.
             use_llm: Enable LLM-based matching.
             use_embedding: Enable embedding-based matching.
@@ -563,18 +783,27 @@ class DecisionGraph:
         """
         sid = session_id or self.store.create_session()
 
-        # Ensure session exists in store
-        if not self.store.session_exists(sid):
+        # ── Session resume: restore state from SQLite if available ─────────
+        session_exists = self.store.session_exists(sid)
+        restored: dict[str, Any] = {}
+
+        if session_exists and session_id:
+            restored = restore_session_state(self.store, sid)
+            if restored:
+                logger.info("Session restored | id=%s | keys=%s", sid, list(restored.keys()))
+        elif not session_exists:
             self.store.create_session({
                 "job_urls": len(job_urls),
                 "use_llm": use_llm,
                 "use_embedding": use_embedding,
             })
 
+        # Build initial state — merge restored data with fresh run params
         initial_state = GraphState(
             job_urls=job_urls,
             resume_file_path=resume_file_path,
             resume_text=resume_text,
+            manual_job_texts=manual_job_texts or [],
             session_id=sid,
             use_llm=use_llm,
             use_embedding=use_embedding,
@@ -584,10 +813,28 @@ class DecisionGraph:
             max_recrawl=self.config.routing.max_recrawl,
         )
 
+        # Apply restored fields (they take precedence over blank defaults)
+        for key, val in restored.items():
+            if key in ("progress_log",) and val:
+                initial_state.progress_log = list(val)
+            elif key == "errors" and val:
+                initial_state.errors = list(val)
+            elif key == "crawler_output" and val:
+                initial_state.crawler_output = val
+            elif key == "normalized_jobs" and val:
+                initial_state.normalized_jobs = val
+            elif key == "resume_output" and val:
+                initial_state.resume_output = val
+            elif key == "match_results" and val:
+                initial_state.match_results = val
+            elif key == "embedding_cache" and val:
+                initial_state.embedding_cache = dict(val)
+
         logger.info("=" * 60)
-        logger.info("DecisionGraph RUN | session=%s | urls=%d | resume=%s | 2-stage=%s",
-                      sid, len(job_urls), resume_file_path or "(inline text)",
-                      self.config.matching.two_stage)
+        logger.info("DecisionGraph RUN | session=%s | urls=%d | manual=%d | resume=%s | 2-stage=%s | restored=%s",
+                      sid, len(job_urls), len(manual_job_texts or []),
+                      resume_file_path or "(inline text)",
+                      self.config.matching.two_stage, bool(restored))
         logger.info("=" * 60)
 
         # Build & compile graph
@@ -596,7 +843,19 @@ class DecisionGraph:
 
         try:
             # Run the graph
-            final_state = await compiled.ainvoke(initial_state)
+            raw_state = await compiled.ainvoke(initial_state)
+
+            # LangGraph may return a dict (early END via conditional edge)
+            # or a GraphState object (full pipeline). Normalize to GraphState.
+            if isinstance(raw_state, dict):
+                # Merge dict back into a fresh GraphState on top of initial_state
+                for key, val in raw_state.items():
+                    if hasattr(initial_state, key):
+                        setattr(initial_state, key, val)
+                final_state = initial_state
+            else:
+                final_state = raw_state
+
             logger.info("DecisionGraph DONE | session=%s | statuses=%s",
                           sid, {k: v.status for k, v in final_state.statuses.items()})
             return final_state
@@ -635,10 +894,12 @@ class DecisionGraph:
             self.on_status_change(node_name, status)
 
     def _emit(self, message: str) -> None:
-        """Emit a progress message."""
+        """Emit a progress message and log to current graph state."""
         logger.info("[Graph] %s", message)
         if self.on_progress:
             self.on_progress(message)
+        if self._current_state is not None:
+            self._current_state.log(message)
 
     def get_graph_status(self, state: GraphState) -> dict[str, Any]:
         """Return a snapshot of the current graph status."""

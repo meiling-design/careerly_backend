@@ -114,6 +114,9 @@ class DecisionGraph:
         # Current graph state (set at start of each node for _emit logging)
         self._current_state: Optional[GraphState] = None
 
+        # Progress tracking for the /tasks endpoint
+        self._completed_nodes: set[str] = set()
+
         # Compiled graph (built lazily)
         self._graph: Optional[Any] = None
 
@@ -783,6 +786,9 @@ class DecisionGraph:
         """
         sid = session_id or self.store.create_session()
 
+        # Reset progress tracking for fresh run
+        self._completed_nodes.clear()
+
         # ── Session resume: restore state from SQLite if available ─────────
         session_exists = self.store.session_exists(sid)
         restored: dict[str, Any] = {}
@@ -879,7 +885,7 @@ class DecisionGraph:
         status: str,
         error: Optional[str] = None,
     ) -> None:
-        """Update the status of a graph node."""
+        """Update the status of a graph node and push progress to state store."""
         timestamp = datetime.now(timezone.utc).isoformat()
         state.statuses[node_name] = AgentStatus(
             name=node_name,
@@ -892,6 +898,19 @@ class DecisionGraph:
         )
         if self.on_status_change:
             self.on_status_change(node_name, status)
+
+        # ── Fire-and-forget: push progress to store for the /tasks endpoint ──
+        completed = None
+        if status in ("completed", "failed", "skipped"):
+            self._completed_nodes.add(node_name)
+            completed = len(self._completed_nodes)
+        try:
+            kwargs: dict[str, Any] = {"current_node": node_name, "node_status": status}
+            if completed is not None:
+                kwargs["completed_count"] = completed
+            self.store.update_session_progress(state.session_id, **kwargs)
+        except RuntimeError:
+            pass  # no running event loop (testing / CLI context)
 
     def _emit(self, message: str) -> None:
         """Emit a progress message and log to current graph state."""

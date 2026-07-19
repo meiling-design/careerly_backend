@@ -1,0 +1,18 @@
+# ── Render Deployment Config ─────────────────────────────────────
+# Deploy on Render: connect GitHub repo → select "Blueprint" → this file
+# Or manually: Web Service → Python → start command below
+
+services:
+  - type: web
+    name: job-matching-agent
+    runtime: python
+    region: singapore
+    plan: starter
+    buildCommand: |
+      pip install -r requirements.txt
+      python -m playwright install chromium --with-deps 2>/dev/null || true
+    startCommand: uvicorn app.api.server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    # Set env vars in Render Dashboard → Environment, NOT via .env (not committed).
+    # Required: DASHSCOPE_API_KEY, DASHSCOPE_BASE_URL, LLM_MODEL
+    # Optional: API_KEY, RATE_LIMIT, REDIS_URL, EMBEDDING_API_KEY

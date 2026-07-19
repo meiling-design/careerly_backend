@@ -11,20 +11,24 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+import time
+
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.core.orchestrator import DecisionGraph
 from app.core.state_store import StateStore
+from app.utils.logger import logger
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="Job Matching AI Agent API",
     description="Multi-agent pipeline: crawl jobs → parse resume → 2-stage matching → ranking report",
-    version="1.0.0",
+    version="0.5.0",
 )
 
 app.add_middleware(
@@ -34,6 +38,55 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Mount versioned API v1 ──────────────────────────────────────────────────
+from app.api.router_v1 import router as v1_router
+app.include_router(v1_router)
+
+# ── Global exception handlers (unified error envelope) ──────────────────────
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "data": None,
+            "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "Request validation failed",
+                "details": exc.errors(),
+            },
+            "meta": {"timestamp": time.time(), "version": "v1"},
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception | path=%s", request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "data": None,
+            "error": {"code": "INTERNAL_ERROR", "message": "Internal server error"},
+            "meta": {"timestamp": time.time(), "version": "v1"},
+        },
+    )
+
+
+# ── Root redirect ──────────────────────────────────────────────────────────
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/api/v1/health")
+
+
+logger.info("API v1 mounted at /api/v1 — see /api/v1/health or /docs")
 
 # Global singletons (lazy-initialised on first request)
 _graph: DecisionGraph | None = None
@@ -104,7 +157,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "service": "job-matching-ai-agent",
-        "version": "1.0.0",
+        "version": "0.5.0",
     }
 
 
@@ -203,7 +256,7 @@ async def get_session(session_id: str) -> JSONResponse:
     })
 
 
-@app.get("/sessions/{session_id}/report")
+@app.get("/sessions/{session_id}/report", response_model=None)
 async def download_report(
     session_id: str,
     fmt: str = Query("json", description="Output format: csv, xlsx, md, json"),

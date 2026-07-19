@@ -156,6 +156,39 @@ class StateStore:
             })
         return results
 
+    def find_by_idempotency_key(self, key: str) -> dict[str, Any] | None:
+        """Find a session by its idempotency key (stored in config_json)."""
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT session_id, status FROM sessions WHERE config_json LIKE ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (f"%{key}%",),
+        ).fetchone()
+        if not row:
+            return None
+        return {"session_id": row["session_id"], "status": row["status"]}
+
+    def update_session_progress(self, session_id: str, **progress: Any) -> None:
+        """Update real-time progress metadata in session config_json.
+
+        Called from orchestrator nodes as they run, so the ``/tasks/{id}``
+        endpoint can report current node and completion status.
+        """
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT config_json FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return
+        cfg = json.loads(row["config_json"]) if row["config_json"] else {}
+        cfg["_progress"] = {**cfg.get("_progress", {}), **progress, "_updated_at": time.time()}
+        conn.execute(
+            "UPDATE sessions SET config_json = ?, updated_at = ? WHERE session_id = ?",
+            (json.dumps(cfg, ensure_ascii=False), time.time(), session_id),
+        )
+        conn.commit()
+
     # ── Jobs ────────────────────────────────────────────────────────────
 
     def save_jobs(self, session_id: str, job_list: JobList) -> None:

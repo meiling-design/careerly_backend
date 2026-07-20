@@ -240,10 +240,9 @@ async def _run_match_background(session_id: str, req: MatchRequest) -> None:
     The API contract (202 + task_id + polling) is designed to support both
     sync and async backends transparently from the client's perspective.
     """
-    store = get_store()
-    graph = get_graph()
-
     try:
+        store = get_store()
+        graph = get_graph()
         store.update_session_status(session_id, "running")
 
         # Run the pipeline — if the pipeline mix uses sync I/O, this will
@@ -260,9 +259,11 @@ async def _run_match_background(session_id: str, req: MatchRequest) -> None:
         # Status updated to "completed" by orchestrator's _node_report
     except Exception as exc:
         logger.error("Background pipeline failed | session=%s | %s", session_id, exc)
+        logger.exception("Full traceback for session %s:", session_id)
         try:
-            store.update_session_status(session_id, "failed")
-            store.append_error(session_id, f"Pipeline crashed: {exc}")
+            store_cleanup = get_store()
+            store_cleanup.update_session_status(session_id, "failed")
+            store_cleanup.append_error(session_id, f"Pipeline crashed: {exc}")
         except Exception:
             pass
 
@@ -294,7 +295,7 @@ async def health() -> JSONResponse:
     return _ok({
         "status": "ok",
         "service": "job-matching-ai-agent",
-        "version": "0.5.0",
+        "version": "1.0.0",
     })
 
 

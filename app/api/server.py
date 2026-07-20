@@ -28,7 +28,7 @@ from app.utils.logger import logger
 app = FastAPI(
     title="Job Matching AI Agent API",
     description="Multi-agent pipeline: crawl jobs → parse resume → 2-stage matching → ranking report",
-    version="0.5.0",
+    version="1.0.0",
 )
 
 app.add_middleware(

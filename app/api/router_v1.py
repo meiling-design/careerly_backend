@@ -58,6 +58,95 @@ router = APIRouter(prefix="/api/v1")
 # ── Background task tracker ─────────────────────────────────────────────────
 
 _background_tasks: dict[str, asyncio.Task] = {}
+"""In-memory map of active asyncio tasks (session_id → Task).
+
+Task metadata is persisted to SQLite via ``TaskTracker`` so that:
+1. Container restarts can identify stale tasks (status='running' with no
+   active asyncio.Task → marked 'interrupted' on startup).
+2. The ``/tasks/{id}`` endpoint reports ``is_running`` accurately even
+   if the in-memory dict is lost.
+
+NOTE: asyncio.Task objects cannot be serialized across restarts. The
+in-memory dict provides runtime tracking; ``TaskTracker`` provides the
+recovery safety-net.
+"""
+
+
+class TaskTracker:
+    """Persistent task metadata helper — wraps StateStore for task lifecycle.
+
+    Stores a ``task_started_at`` timestamp in the session config so the
+    system can detect stale tasks after a restart and apply timeouts.
+    """
+
+    TIMEOUT_SECONDS = int(os.getenv("TASK_TIMEOUT_SECONDS", "600"))
+
+    @staticmethod
+    def register(store: StateStore, session_id: str) -> None:
+        """Write a start timestamp into the session config."""
+        info = store.get_session_info(session_id)
+        if not info:
+            logger.warning("TaskTracker: session %s not found, cannot register", session_id)
+            return
+        cfg = dict(info.get("config") or {})
+        cfg["_task"] = {
+            "started_at": time.time(),
+            "timeout": TaskTracker.TIMEOUT_SECONDS,
+            "started_by": os.getenv("RAILWAY_SERVICE_NAME", "api"),
+        }
+        store.update_session_config(session_id, cfg)
+        logger.info("TaskTracker: registered task | session=%s | timeout=%ds",
+                    session_id, TaskTracker.TIMEOUT_SECONDS)
+
+    @staticmethod
+    def unregister(store: StateStore, session_id: str) -> None:
+        """Remove runtime task metadata (task completed normally)."""
+        store.update_session_config_key(session_id, "_task", None)
+        logger.info("TaskTracker: unregistered task | session=%s", session_id)
+
+    @staticmethod
+    def is_stale(info: dict[str, Any]) -> bool:
+        """Check whether a session with ``_task`` metadata is stale.
+
+        A task is stale when:
+        - Its status is 'running' but no asyncio.Task exists for it.
+        - OR it has exceeded the configured timeout.
+        """
+        cfg = info.get("config") or {}
+        task_meta = cfg.get("_task")
+        if not task_meta:
+            return False
+        started = task_meta.get("started_at", 0)
+        elapsed = time.time() - started
+        if elapsed > task_meta.get("timeout", TaskTracker.TIMEOUT_SECONDS):
+            return True
+        return False
+
+    @staticmethod
+    async def recover_stale_tasks(store: StateStore) -> int:
+        """Scan for stale sessions and mark them 'interrupted'.
+
+        Called at server startup to recover from container restarts.
+
+        Returns the number of sessions that were recovered.
+        """
+        sessions = store.list_sessions(limit=500)
+        recovered = 0
+        for s in sessions:
+            if s["status"] != "running":
+                continue
+            if TaskTracker.is_stale(s):
+                store.update_session_status(s["session_id"], "interrupted")
+                store.append_error(
+                    s["session_id"],
+                    "Task interrupted by server restart or timeout — "
+                    "the pipeline was still running when the container was replaced.",
+                )
+                logger.warning("TaskTracker: recovered stale session | id=%s", s["session_id"])
+                recovered += 1
+        if recovered:
+            logger.info("TaskTracker: recovered %d stale session(s) at startup", recovered)
+        return recovered
 
 # ── Envelope helpers ────────────────────────────────────────────────────────
 
@@ -229,42 +318,76 @@ class TaskResult(BaseModel):
 async def _run_match_background(session_id: str, req: MatchRequest) -> None:
     """Execute the full matching pipeline in a background asyncio task.
 
-    Note: The current pipeline uses synchronous I/O (requests, OpenAI sync
-    client) via LangGraph, which will block the event loop during execution.
-    For production scenarios with concurrent requests, consider either:
+    NOTE: The current pipeline uses synchronous I/O (requests, OpenAI sync
+    client) via LangGraph. To prevent blocking the event loop, the pipeline
+    is offloaded to a thread executor.
 
-    1. Running this function via ``loop.run_in_executor()`` after converting
-       ``graph.run()`` to a sync wrapper, OR
-    2. Replacing sync HTTP clients with async ones (httpx, openai.AsyncOpenAI)
-
-    The API contract (202 + task_id + polling) is designed to support both
-    sync and async backends transparently from the client's perspective.
+    Production roadmap:
+    1. ✅ Thread executor — prevents event-loop blocking (current fix)
+    2. ⏳ Replace sync clients: requests → httpx, OpenAI → AsyncOpenAI
+    3. ⏳ Dedicated task queue (Redis + RQ / Celery) for multi-instance
     """
     store = get_store()
     graph = get_graph()
+    loop = asyncio.get_running_loop()
+
+    # Register task metadata (for restart recovery & monitoring)
+    TaskTracker.register(store, session_id)
+
+    logger.info("Task started | session=%s | urls=%d | use_llm=%s | timeout=%ds",
+                session_id, len(req.job_urls), req.use_llm, TaskTracker.TIMEOUT_SECONDS)
 
     try:
         store.update_session_status(session_id, "running")
 
-        # Run the pipeline — if the pipeline mix uses sync I/O, this will
-        # block the event loop. A future upgrade should make the pipeline
-        # fully async or delegate to a thread executor / task queue.
-        await graph.run(
-            job_urls=req.job_urls,
-            resume_file_path=req.resume_file_path,
-            resume_text=req.resume_text,
-            session_id=session_id,
-            use_llm=req.use_llm,
-            use_embedding=req.use_embedding,
+        # ── Run pipeline in thread executor to avoid blocking event loop ──
+        # The sync pipeline (requests + OpenAI) is wrapped in run_sync()
+        # and dispatched to a thread pool. This allows concurrent requests
+        # to be handled while the pipeline runs.
+        def _run_sync() -> GraphState:
+            """Synchronous wrapper — runs in thread executor."""
+            return graph.run_sync(
+                job_urls=req.job_urls,
+                resume_file_path=req.resume_file_path,
+                resume_text=req.resume_text,
+                session_id=session_id,
+                use_llm=req.use_llm,
+                use_embedding=req.use_embedding,
+            )
+
+        final_state = await asyncio.wait_for(
+            loop.run_in_executor(None, _run_sync),
+            timeout=TaskTracker.TIMEOUT_SECONDS,
         )
+        logger.info("Task completed | session=%s | routing=%s",
+                    session_id, final_state.routing_decision if final_state else "?")
         # Status updated to "completed" by orchestrator's _node_report
+
+    except asyncio.TimeoutError:
+        logger.error("Task timed out | session=%s | timeout=%ds",
+                     session_id, TaskTracker.TIMEOUT_SECONDS)
+        try:
+            store.update_session_status(session_id, "timed_out")
+            store.append_error(
+                session_id,
+                f"Pipeline timed out after {TaskTracker.TIMEOUT_SECONDS}s — "
+                f"consider increasing TASK_TIMEOUT_SECONDS or optimizing pipeline.",
+            )
+        except Exception:
+            pass
+
     except Exception as exc:
-        logger.error("Background pipeline failed | session=%s | %s", session_id, exc)
+        logger.error("Task failed | session=%s | %s", session_id, exc)
         try:
             store.update_session_status(session_id, "failed")
             store.append_error(session_id, f"Pipeline crashed: {exc}")
         except Exception:
             pass
+
+    finally:
+        # Unregister task metadata (success, failure, or timeout)
+        TaskTracker.unregister(store, session_id)
+        logger.info("Task cleaned up | session=%s", session_id)
 
 
 # ── Helper: idempotency key computation ────────────────────────────────────

@@ -875,6 +875,40 @@ class DecisionGraph:
             return initial_state
 
     # ═════════════════════════════════════════════════════════════════════
+    #  Sync runner (for thread-pool offloading)
+    # ═════════════════════════════════════════════════════════════════════
+
+    def run_sync(
+        self,
+        job_urls: list[str],
+        resume_file_path: Optional[str] = None,
+        resume_text: Optional[str] = None,
+        manual_job_texts: Optional[list[str]] = None,
+        session_id: Optional[str] = None,
+        use_llm: bool = True,
+        use_embedding: bool = True,
+    ) -> GraphState:
+        """Synchronous wrapper for ``run()`` — runs in a thread executor.
+
+        Uses ``asyncio.run()`` internally to drive the async pipeline.
+        Intended to be called via ``loop.run_in_executor()`` from an async
+        handler so the event loop is not blocked by synchronous I/O.
+
+        See ``_run_match_background`` in ``router_v1.py`` for the primary
+        call site.
+        """
+        import asyncio as _asyncio
+        return _asyncio.run(self.run(
+            job_urls=job_urls,
+            resume_file_path=resume_file_path,
+            resume_text=resume_text,
+            manual_job_texts=manual_job_texts,
+            session_id=session_id,
+            use_llm=use_llm,
+            use_embedding=use_embedding,
+        ))
+
+    # ═════════════════════════════════════════════════════════════════════
     #  Status & Progress helpers
     # ═════════════════════════════════════════════════════════════════════
 

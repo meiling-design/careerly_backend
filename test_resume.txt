@@ -1,0 +1,35 @@
+姓名: 张三
+邮箱: zhangsan@example.com
+电话: 138-0000-0000
+
+技能:
+- Python (5年经验) - FastAPI, Django, Flask
+- JavaScript/TypeScript - React, Node.js
+- 数据库: PostgreSQL, Redis, MongoDB
+- DevOps: Docker, Kubernetes, AWS
+- 大数据: Spark, Kafka
+- AI/ML: LangChain, LangGraph, OpenAI API, RAG
+
+工作经验:
+
+高级后端工程师 | 某科技公司 | 2022-2025
+- 基于FastAPI设计并实现了微服务架构，支撑日均100万+请求
+- 使用LangChain/LangGraph构建AI Agent流水线，实现自动化文档处理
+- 主导系统从单体架构迁移至Kubernetes集群
+- 优化数据库查询，将API响应时间降低60%
+
+后端工程师 | 某互联网公司 | 2019-2022
+- 使用Django开发RESTful API，服务50万+用户
+- 设计并实现实时数据管道（Kafka + Spark Streaming）
+- 构建基于Redis的缓存层，数据库负载降低40%
+
+项目经历:
+1. AI智能匹配系统 - 使用LangGraph构建多智能体流水线，实现简历-职位智能匹配
+2. 实时数据平台 - 基于Kafka + Spark Streaming的实时数据处理平台
+
+教育背景:
+- 计算机科学与技术 本科 | 某985大学 | 2015-2019
+
+证书:
+- AWS认证解决方案架构师（SAA-C03）
+- 阿里云ACA云计算认证

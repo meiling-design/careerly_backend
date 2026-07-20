@@ -189,6 +189,35 @@ class StateStore:
         )
         conn.commit()
 
+    def update_session_config(self, session_id: str, config: dict) -> None:
+        """Replace the entire session config_json."""
+        conn = _get_conn(self.db_path)
+        conn.execute(
+            "UPDATE sessions SET config_json = ?, updated_at = ? WHERE session_id = ?",
+            (json.dumps(config, ensure_ascii=False), time.time(), session_id),
+        )
+        conn.commit()
+
+    def update_session_config_key(self, session_id: str, key: str, value: Any) -> None:
+        """Set or delete (if value is None) a single key in config_json."""
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT config_json FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row:
+            return
+        cfg = json.loads(row["config_json"]) if row["config_json"] else {}
+        if value is None:
+            cfg.pop(key, None)
+        else:
+            cfg[key] = value
+        conn.execute(
+            "UPDATE sessions SET config_json = ?, updated_at = ? WHERE session_id = ?",
+            (json.dumps(cfg, ensure_ascii=False), time.time(), session_id),
+        )
+        conn.commit()
+
     # ── Jobs ────────────────────────────────────────────────────────────
 
     def save_jobs(self, session_id: str, job_list: JobList) -> None:

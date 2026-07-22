@@ -43,6 +43,10 @@ app.add_middleware(
 from app.api.router_v1 import router as v1_router
 app.include_router(v1_router)
 
+# ── Mount App API ──────────────────────────────────────────────────────────
+from app.api.router_app import router as app_router
+app.include_router(app_router)
+
 # ── Global exception handlers (unified error envelope) ──────────────────────
 
 
@@ -157,7 +161,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "service": "job-matching-ai-agent",
-        "version": "0.5.0",
+        "version": "1.0.0",
     }
 
 

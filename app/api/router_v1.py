@@ -79,7 +79,7 @@ class TaskTracker:
     system can detect stale tasks after a restart and apply timeouts.
     """
 
-    TIMEOUT_SECONDS = int(os.getenv("TASK_TIMEOUT_SECONDS", "600"))
+    TIMEOUT_SECONDS = int(os.getenv("TASK_TIMEOUT_SECONDS", "3600"))
 
     @staticmethod
     def register(store: StateStore, session_id: str) -> None:
@@ -215,9 +215,9 @@ _ALLOWED_CLIENT_KEYS: list[str] = [
 _DEMO_GUARD = DemoGuard()
 
 # Input limits (token estimation: ~1 token ≈ 4 chars for mixed CN/EN)
-_MAX_RESUME_CHARS = int(os.getenv("MAX_RESUME_CHARS", "80000"))     # ~20k tokens
-_MAX_JD_CHARS = int(os.getenv("MAX_JD_CHARS", "20000"))             # ~5k tokens
-_MAX_JOB_URLS = int(os.getenv("MAX_JOB_URLS", "10"))
+_MAX_RESUME_CHARS = int(os.getenv("MAX_RESUME_CHARS", "500000"))    # ~125k tokens
+_MAX_JD_CHARS = int(os.getenv("MAX_JD_CHARS", "100000"))            # ~25k tokens
+_MAX_JOB_URLS = int(os.getenv("MAX_JOB_URLS", "100"))
 
 
 def _get_visitor_id(request: Request) -> str:

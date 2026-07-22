@@ -37,8 +37,8 @@ DB_PATH = DATA_DIR / "graph_state.db"
 
 import os
 
-_DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() in ("1", "true", "yes")
-_MAX_DEMO_MATCHES = int(os.getenv("DEMO_MAX_MATCHES", "1"))
+_DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() in ("1", "true", "yes")
+_MAX_DEMO_MATCHES = int(os.getenv("DEMO_MAX_MATCHES", "999"))
 
 
 class DemoGuard:

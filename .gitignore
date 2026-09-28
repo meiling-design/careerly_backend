@@ -31,10 +31,11 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Local auth database (contains password hashes — never commit)
-app/data/auth.db
-app/data/auth.db-shm
-app/data/auth.db-wal
+# Runtime SQLite databases (local state — never commit)
+app/data/*.db
+app/data/*.db-shm
+app/data/*.db-wal
+data/*.db
 
 # WorkBuddy local memory / workspace data
 .workbuddy/

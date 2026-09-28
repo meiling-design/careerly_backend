@@ -30,3 +30,11 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local auth database (contains password hashes — never commit)
+app/data/auth.db
+app/data/auth.db-shm
+app/data/auth.db-wal
+
+# WorkBuddy local memory / workspace data
+.workbuddy/

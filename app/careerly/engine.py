@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from app.careerly.schemas import (
     AnalysisProject,
@@ -25,6 +25,7 @@ from app.careerly.schemas import (
     GapDetail,
     JobMatch,
     JobModel,
+    StrengthScore,
     iso,
 )
 from app.models.match import MatchResult
@@ -50,6 +51,27 @@ class AnalysisError(Exception):
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+
+def _score_capabilities_safe(resume: Any, raw_jd: str) -> Optional[list[dict]]:
+    """C4: one LLM call for capability scores; any failure degrades to None.
+
+    Never raises — a scoring failure must not break the analysis (decision:
+    LLM 评分 + 失败降级).
+    """
+    try:
+        from app.careerly.capability import normalize
+        from app.services.llm_service import LLMService
+
+        profile = resume.model_dump() if hasattr(resume, "model_dump") else dict(resume)
+        raw = LLMService().score_capabilities(profile, raw_jd)
+        caps = normalize(raw)
+        if caps:
+            logger.info("Careerly capability scoring OK | %d dimensions", len(caps))
+        return caps
+    except Exception as exc:  # pragma: no cover - defensive: LLM/network failures
+        logger.warning("Careerly capability scoring skipped: %s", exc)
+        return None
 
 
 def to_job_match(result: MatchResult, job_id: str, rank: int) -> JobMatch:
@@ -98,8 +120,16 @@ def build_project(
     raw_jd: str,
     match_results: list[MatchResult],
     source: str = "paste",
+    capabilities: Optional[list[dict]] = None,
 ) -> AnalysisProject:
-    """Assemble a version-1 ``AnalysisProject`` from engine results."""
+    """Assemble a version-1 ``AnalysisProject`` from engine results.
+
+    ``capabilities`` (C4, optional) is the validated output of
+    :mod:`app.careerly.capability` — when present it fills
+    ``strengthScores`` / ``gapDetails`` (with yours/target/why/actions) and
+    ``capabilitySnapshot``; otherwise those stay at the pre-C4 defaults
+    (empty / null / {}).
+    """
     now = time.time()
     job_id = _new_id("job")
     job = JobModel(
@@ -123,9 +153,12 @@ def build_project(
         version=1,
         resumeVersionId=None,
         matches=matches,
-        capabilitySnapshot={},  # C4 — no capability score model yet
+        capabilitySnapshot={},  # C4 — filled when capability scoring succeeded
         createdAt=iso(now),
     )
+
+    if capabilities:
+        _apply_capabilities(result, capabilities)
 
     project_id = _new_id("proj")
     result.projectId = project_id
@@ -138,6 +171,42 @@ def build_project(
         createdAt=iso(now),
         updatedAt=iso(now),
     )
+
+
+# Gap "distance" threshold: target - yours >= this → 关键 Gap, else 一般 Gap
+_KEY_GAP_DELTA = 12
+# A capability only counts as a "strength" at/above this score (demo fixture
+# shows the weakest dimension excluded from strengthScores)
+_STRENGTH_FLOOR = 60
+
+
+def _apply_capabilities(result: AnalysisResult, capabilities: list[dict]) -> None:
+    """Fill C4 fields on the single result from validated capability scores."""
+    ranked = sorted(capabilities, key=lambda c: c["yours"], reverse=True)
+
+    strengths = [c for c in ranked if c["yours"] >= _STRENGTH_FLOOR][:6]
+    snapshot = {c["name"]: c["yours"] for c in capabilities}
+
+    for match in result.matches:
+        match.strengthScores = [StrengthScore(name=c["name"], score=c["yours"]) for c in strengths]
+        # Product intent (demo fixture L146): strengths mirror strengthScores names
+        match.strengths = [s.name for s in match.strengthScores] or match.strengths
+        match.gapDetails = [
+            GapDetail(
+                name=c["name"],
+                yours=c["yours"],
+                target=c["target"],
+                level="关键 Gap" if c["target"] - c["yours"] >= _KEY_GAP_DELTA else "一般 Gap",
+                why=c["why"],
+                actions=c["actions"],
+            )
+            for c in ranked
+        ]
+        if match.gapDetails:
+            top_actions = match.gapDetails[0].actions
+            match.suggestion = match.suggestion or (top_actions[0] if top_actions else None)
+
+    result.capabilitySnapshot = snapshot
 
 
 def run_analysis(
@@ -182,7 +251,10 @@ def run_analysis(
         detail = "；".join(state.errors) if state.errors else "引擎未返回匹配结果"
         raise AnalysisError("ANALYSIS_EMPTY", f"未能产出匹配结果：{detail}", 422)
 
-    project = build_project(title=title, raw_jd=raw_jd, match_results=results)
+    capabilities = _score_capabilities_safe(state.resume, raw_jd) if state.resume else None
+    project = build_project(
+        title=title, raw_jd=raw_jd, match_results=results, capabilities=capabilities,
+    )
     logger.info(
         "Careerly analysis done | %.1fs | session=%s | score=%s",
         time.time() - started,

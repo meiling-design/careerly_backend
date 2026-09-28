@@ -264,6 +264,12 @@ Flutter / Baseline §5（硬规则）：免费 3 次；上传简历、粘贴 JD�
 `Capability.score` / `AnalysisResult.capabilitySnapshot` / `GapDetail.yours,target` / `StrengthScore.score` 都要求**每项能力一个 0–100 分**；后端只有 `_skill_overlap()` 的命中率与语义相似度，**没有能力维度的分值**。
 → 这是「看见成长」（能力变化、gap 收窄）的**数学前提**。需要新增：能力维度定义 + 从简历/JD 推导每维分值（可由 `llm_service` 新增一个 `CAPABILITY_SCORING` 提示词产出）。
 
+> **✅ 已解决（2026-09-29，commit 见 git log）**：方案 = **LLM 评分 + 失败降级**（用户裁决）。
+> - `llm_service.score_capabilities()` + `CAPABILITY_SCORING_PROMPT`：从简历画像+JD 提炼 3–8 个**动态**能力维度（维度名随用户简历而变，与 demo_fixture 的 `产品规划/AI 应用能力` 形态一致），每维产出 yours/target/why/actions；
+> - `careerly/capability.normalize()`：严格校验（类型/0–100 截断/去重/数量），任何不合格 → `None`；
+> - `careerly/engine._apply_capabilities()`：`capabilitySnapshot = {name: yours}`；`strengthScores` = yours≥60 按 desc 取前 6（demo fixture L146 的产品意图：`strengths` 镜像 strengthScores 的 name）；`gapDetails` = 能力级（`target-yours ≥ 12` → 关键 Gap）；
+> - 评分失败时**完整回退**到 C4 之前的行为（yours/target=null、snapshot={}），分析永不因此中断。
+
 ### 🔴 C5 — 会话持久化 → user_id 隔离无处落地
 
 Flutter D52：**不引入本地存储、不保存会话**；D54 待裁决（「已登录则跳过 Onboarding」）。

@@ -126,6 +126,25 @@ BATCH_MATCH_PROMPT = """你是一名资深的招聘匹配专家。请评估以�
 
 只输出JSON数组，不要其他文字。"""
 
+# ── ⭐ Careerly 能力评分提示词（C4：能力分值模型） ────────────────────
+
+CAPABILITY_SCORING_PROMPT = """你是职业能力评估专家。根据候选人的简历画像与目标岗位JD，提炼候选人的核心能力维度并打分。
+
+要求：
+- 提炼 4-6 个能力维度，维度名用中文（如「后端架构」「数据库与存储」「商业化经验」）。
+  维度名必须是能力领域，不要用具体技能名（如 Python）；
+- 每个维度给出 yours（候选人当前水平 0-100）与 target（目标岗位期望水平 0-100）；
+- why：一句话说明评分依据，必须引用简历中的具体经历或明确指出缺失；
+- actions：1-3 条具体可执行的提升行动建议。
+
+输出必须是JSON格式：
+{
+  "capabilities": [
+    {"name": "能力维度", "yours": 68, "target": 82, "why": "…", "actions": ["…"]}
+  ]
+}
+只输出JSON，不要其他文字。"""
+
 
 class LLMService:
     """Unified LLM client supporting OpenAI-compatible APIs (including DashScope)."""
@@ -251,6 +270,17 @@ class LLMService:
             f"{json.dumps(quality_signals, ensure_ascii=False, indent=2)}"
         )
         return self.chat_json(ROUTING_PROMPT, user_prompt)
+
+    def score_capabilities(self, resume_profile: dict, job_text: str) -> dict:
+        """Careerly C4: score 4-6 capability dimensions from resume vs target JD.
+
+        Returns ``{"capabilities": [{"name", "yours", "target", "why", "actions"}]}``.
+        """
+        user_prompt = (
+            f"【简历画像】\n{json.dumps(resume_profile, ensure_ascii=False, indent=2)}\n\n"
+            f"【目标岗位JD】\n{job_text}"
+        )
+        return self.chat_json(CAPABILITY_SCORING_PROMPT, user_prompt)
 
     # ── ⭐ Batch LLM Matching ─────────────────────────────────────────────
 

@@ -1,13 +1,21 @@
 """Authentication endpoints: register / login / refresh / me.
 
+Identity model (Careerly 产品裁决 D85)
+-------------------------------------
+```text
+register   name(必填) · phone(必填) · email(选填)
+login      phone(必填)          —— 无密码、无验证码
+```
+
+The account identity is the **phone number**; there is no credential in the
+Careerly contract. Bearer tokens are still issued as stateless JWTs (see
+``app.core.security``) so the mobile client can move to authenticated calls
+without another schema change.
+
 All responses use the same envelope as ``router_v1``:
 
     {"success": bool, "data": ..., "error": {code, message} | None,
      "meta": {timestamp, version: "v1"}}
-
-Bearer tokens are issued as stateless JWTs (see ``app.core.security``).
-This module keeps a *local* copy of the envelope helpers to avoid a
-cross-module dependency on ``router_v1``.
 """
 
 from __future__ import annotations
@@ -62,19 +70,17 @@ def _err(code: str, message: str, status_code: int = 400) -> JSONResponse:
 
 
 class RegisterRequest(BaseModel):
-    """POST /auth/register body."""
+    """POST /auth/register body — Careerly D85 field set."""
 
-    email: EmailStr
-    username: Optional[str] = Field(None, description="Optional display/username")
-    password: str = Field(..., min_length=8, description="At least 8 characters")
-    confirm_password: str
+    phone: str = Field(..., min_length=5, max_length=20, description="手机号，账号身份")
+    name: str = Field(..., min_length=1, max_length=50, description="姓名 / 昵称")
+    email: Optional[EmailStr] = Field(None, description="邮箱（选填）")
 
 
 class LoginRequest(BaseModel):
-    """POST /auth/login body. identifier may be email or username."""
+    """POST /auth/login body — phone only, no credential (D85)."""
 
-    identifier: str = Field(..., description="Email or username")
-    password: str
+    phone: str = Field(..., min_length=5, max_length=20)
 
 
 class RefreshRequest(BaseModel):
@@ -87,11 +93,12 @@ class RefreshRequest(BaseModel):
 
 
 def _public_user(user: dict[str, Any]) -> dict[str, Any]:
-    """Return the safe subset of a user dict for responses (no internal fields)."""
+    """Return the safe subset of a user dict for responses."""
     return {
         "id": user["id"],
+        "phone": user["phone"],
+        "name": user["name"],
         "email": user["email"],
-        "username": user["username"],
     }
 
 
@@ -100,22 +107,17 @@ def _public_user(user: dict[str, Any]) -> dict[str, Any]:
 
 @router.post("/auth/register", status_code=201)
 async def register(req: RegisterRequest) -> JSONResponse:
-    """Create a new account and return the user + a fresh token pair."""
-    from app.core.security import hash_password
-
+    """Create a new account (identity = phone) and return a fresh token pair."""
     store = AuthStore()
+    phone = req.phone.strip()
 
-    if req.password != req.confirm_password:
-        return _err("PASSWORD_MISMATCH", "Passwords do not match", 400)
+    if store.phone_exists(phone):
+        return _err("PHONE_EXISTS", "该手机号已注册", 409)
 
-    if store.email_exists(req.email):
-        return _err("EMAIL_EXISTS", "Email already registered", 409)
+    if req.email and store.email_exists(req.email):
+        return _err("EMAIL_EXISTS", "该邮箱已被使用", 409)
 
-    if req.username and store.username_exists(req.username):
-        return _err("USERNAME_EXISTS", "Username already taken", 409)
-
-    password_hash = hash_password(req.password)
-    user_id = store.create_user(req.email, req.username, password_hash)
+    user_id = store.create_user(phone, req.name.strip(), req.email)
     user = store.get_by_id(user_id)
     if user is None:
         return _err("INTERNAL_ERROR", "Failed to create user", 500)
@@ -126,24 +128,19 @@ async def register(req: RegisterRequest) -> JSONResponse:
 
 @router.post("/auth/login")
 async def login(req: LoginRequest) -> JSONResponse:
-    """Authenticate by email/username + password; return a token pair."""
-    from app.core.security import verify_password
+    """Authenticate by phone number; return a token pair.
 
+    ⚠️ 未决项 C1b：PRD / IA 均未定义「手机号未注册」的产品规则
+    （``AuthRepository.login`` 的 Mock 刻意不判断账号是否存在）。
+    此处取最小实现：未注册即 401 PHONE_NOT_REGISTERED，等待产品侧裁决。
+    """
     store = AuthStore()
+    user = store.get_by_phone(req.phone.strip())
 
-    # Identifier may be an email or a username.
-    user = store.get_by_email(req.identifier)
     if user is None:
-        user = store.get_by_username(req.identifier)
-
-    # Single generic error to avoid user enumeration.
-    if user is None or not user.get("is_active", 1):
-        return _err("INVALID_CREDENTIALS", "邮箱/用户名或密码错误", 401)
-
-    # ``_row_to_user`` intentionally strips the hash, so fetch it separately.
-    password_hash = store.get_password_hash(user["id"])
-    if not password_hash or not verify_password(req.password, password_hash):
-        return _err("INVALID_CREDENTIALS", "邮箱/用户名或密码错误", 401)
+        return _err("PHONE_NOT_REGISTERED", "该手机号尚未注册", 401)
+    if not user.get("is_active", 1):
+        return _err("ACCOUNT_DISABLED", "账号已停用", 403)
 
     tokens = issue_tokens(user)
     return _ok({"user": _public_user(user), **tokens})
@@ -184,4 +181,4 @@ async def refresh(req: RefreshRequest) -> JSONResponse:
 @router.get("/auth/me")
 async def me(current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """Return the currently authenticated user (resolved from Bearer token)."""
-    return _ok({"user": current_user})
+    return _ok({"user": _public_user(current_user)})

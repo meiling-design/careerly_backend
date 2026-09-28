@@ -1,5 +1,16 @@
 """SQLite-backed user store for JWT authentication.
 
+Identity model
+--------------
+Careerly's account identity is the **phone number** (产品裁决 D85:
+``register(name, phone, email?)`` / ``login(phone)`` -- no password and no
+verification code). The store therefore no longer requires credentials.
+
+``password_hash`` is kept as a **nullable** column, reserved for a possible
+future D85 revisit; nothing writes to it today.
+
+Storage
+-------
 Mirrors ``app.core.state_store`` (thread-local connections + WAL) but uses a
 **dedicated database file** (``app/data/auth.db``) so authentication data
 never mixes with graph session state in ``graph_state.db``.
@@ -50,30 +61,48 @@ class AuthStore:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                email         TEXT UNIQUE NOT NULL,
-                username      TEXT UNIQUE,
-                password_hash TEXT NOT NULL,
+                phone         TEXT UNIQUE NOT NULL,
+                name          TEXT NOT NULL DEFAULT '',
+                email         TEXT UNIQUE,
+                password_hash TEXT,
                 is_active     INTEGER NOT NULL DEFAULT 1,
                 created_at    REAL NOT NULL,
                 updated_at    REAL NOT NULL
             );
         """)
+        self._migrate(conn)
         conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Bring an older ``users`` table up to the current column set.
+
+        ``CREATE TABLE IF NOT EXISTS`` is a no-op on an existing database, so
+        columns added after the first release have to be filled in explicitly.
+        """
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+        if "phone" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+        if "name" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+        # Cannot add UNIQUE via ALTER TABLE; a unique index is equivalent.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)"
+        )
 
     # ── Create ───────────────────────────────────────────────────────────
 
-    def create_user(self, email: str, username: str | None, password_hash: str) -> int:
+    def create_user(self, phone: str, name: str = "", email: str | None = None) -> int:
         """Insert a new user; return the new auto-increment id."""
         now = time.time()
         conn = _get_conn(self.db_path)
         cur = conn.execute(
-            "INSERT INTO users (email, username, password_hash, is_active, created_at, updated_at) "
+            "INSERT INTO users (phone, name, email, is_active, created_at, updated_at) "
             "VALUES (?, ?, ?, 1, ?, ?)",
-            (email, username, password_hash, now, now),
+            (phone, name, email, now, now),
         )
         conn.commit()
         user_id = int(cur.lastrowid)
-        logger.info("AuthStore: user created | id=%d | email=%s", user_id, email)
+        logger.info("AuthStore: user created | id=%d | phone=%s", user_id, phone)
         return user_id
 
     # ── Reads ────────────────────────────────────────────────────────────
@@ -83,50 +112,37 @@ class AuthStore:
         """Convert a ``users`` row into a public dict (never includes hash)."""
         return {
             "id": row["id"],
+            "phone": row["phone"],
+            "name": row["name"] or "",
             "email": row["email"],
-            "username": row["username"],
             "is_active": bool(row["is_active"]),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
-
-    def get_by_email(self, email: str) -> dict[str, Any] | None:
-        conn = _get_conn(self.db_path)
-        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
-        return self._row_to_user(row) if row else None
-
-    def get_by_username(self, username: str) -> dict[str, Any] | None:
-        conn = _get_conn(self.db_path)
-        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-        return self._row_to_user(row) if row else None
 
     def get_by_id(self, user_id: int) -> dict[str, Any] | None:
         conn = _get_conn(self.db_path)
         row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
         return self._row_to_user(row) if row else None
 
-    def get_password_hash(self, user_id: int) -> str | None:
-        """Return the stored bcrypt hash for *user_id*.
-
-        Kept deliberately separate from ``_row_to_user`` (which never exposes
-        the hash) so the credential can only ever be surfaced inside the login
-        flow, never through the public user dict returned by ``get_by_id`` /
-        ``get_by_email`` / ``get_by_username``.
-        """
+    def get_by_phone(self, phone: str) -> dict[str, Any] | None:
         conn = _get_conn(self.db_path)
-        row = conn.execute(
-            "SELECT password_hash FROM users WHERE id = ?", (user_id,)
-        ).fetchone()
-        return row["password_hash"] if row else None
+        row = conn.execute("SELECT * FROM users WHERE phone = ?", (phone,)).fetchone()
+        return self._row_to_user(row) if row else None
+
+    def get_by_email(self, email: str) -> dict[str, Any] | None:
+        conn = _get_conn(self.db_path)
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        return self._row_to_user(row) if row else None
 
     # ── Uniqueness checks ───────────────────────────────────────────────
+
+    def phone_exists(self, phone: str) -> bool:
+        conn = _get_conn(self.db_path)
+        row = conn.execute("SELECT 1 FROM users WHERE phone = ?", (phone,)).fetchone()
+        return row is not None
 
     def email_exists(self, email: str) -> bool:
         conn = _get_conn(self.db_path)
         row = conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone()
-        return row is not None
-
-    def username_exists(self, username: str) -> bool:
-        conn = _get_conn(self.db_path)
-        row = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
         return row is not None

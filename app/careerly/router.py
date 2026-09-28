@@ -104,6 +104,17 @@ async def list_projects(
     return ok([dump(p) for p in projects])
 
 
+@router.get("/analysis/jobs")
+async def list_job_library(
+    limit: int = 100,
+    current_user: dict = Depends(get_current_user),
+):
+    """历史岗位库（PRD §9.3）：从本项目移除岗位不删除岗位记录。"""
+    store = get_store()
+    jobs = store.list_jobs(int(current_user["id"]), limit=min(max(limit, 1), 200))
+    return ok([dump(j) for j in jobs])
+
+
 @router.get("/analysis/projects/{project_id}")
 async def get_project(
     project_id: str,

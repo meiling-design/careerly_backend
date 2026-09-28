@@ -31,6 +31,12 @@ pyyaml>=6.0                  # config.yaml loading
 fastapi>=0.110                # API server
 uvicorn[standard]>=0.29       # ASGI server
 
+# ── Auth ──────────────────────────────────────────────────────────
+passlib>=1.7.4
+bcrypt>=4.0
+python-jose[cryptography]>=3.3.0
+email-validator>=2.0          # required by pydantic EmailStr in router_auth
+
 # ── Database ──────────────────────────────────────────────────────
 aiosqlite>=0.17               # async SQLite for demo usage tracking
 

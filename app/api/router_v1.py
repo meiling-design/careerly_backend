@@ -42,11 +42,12 @@ import time
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.orchestrator import DecisionGraph
+from app.core.security import get_current_user
 from app.core.state_store import StateStore
 from app.services.demo_guard import DemoGuard
 from app.utils.logger import logger
@@ -502,7 +503,7 @@ async def reload_config() -> JSONResponse:
 
 
 @router.post("/match", status_code=202)
-async def run_match(req: MatchRequest, request: Request) -> JSONResponse:
+async def run_match(req: MatchRequest, request: Request, current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """Submit a job-matching request.
 
     Returns immediately (202) with a ``task_id``.
@@ -579,7 +580,7 @@ async def run_match(req: MatchRequest, request: Request) -> JSONResponse:
 
 
 @router.get("/tasks/{task_id}")
-async def get_task_status(task_id: str) -> JSONResponse:
+async def get_task_status(task_id: str, current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """Poll task status and result.
 
     A mobile client can call this every 2-3 seconds after submitting
@@ -633,7 +634,7 @@ async def get_task_status(task_id: str) -> JSONResponse:
 
 
 @router.get("/tasks")
-async def list_tasks(limit: int = Query(20, ge=1, le=100)) -> JSONResponse:
+async def list_tasks(limit: int = Query(20, ge=1, le=100), current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """List recent tasks (lightweight, same as /sessions)."""
     store = get_store()
     rows = store.list_sessions(limit=limit)
@@ -662,7 +663,7 @@ async def list_tasks(limit: int = Query(20, ge=1, le=100)) -> JSONResponse:
 
 
 @router.get("/sessions")
-async def list_sessions(limit: int = Query(20, ge=1, le=200)) -> JSONResponse:
+async def list_sessions(limit: int = Query(20, ge=1, le=200), current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """List recent sessions with basic stats."""
     store = get_store()
     rows = store.list_sessions(limit=limit)
@@ -683,7 +684,7 @@ async def list_sessions(limit: int = Query(20, ge=1, le=200)) -> JSONResponse:
 
 
 @router.get("/sessions/{session_id}")
-async def get_session(session_id: str) -> JSONResponse:
+async def get_session(session_id: str, current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """Get full session details including jobs, resume, and match results."""
     store = get_store()
     state = store.load_state(session_id)
@@ -724,6 +725,7 @@ async def get_session(session_id: str) -> JSONResponse:
 async def download_report(
     session_id: str,
     fmt: str = Query("json", description="Output format: csv, xlsx, md, json"),
+    current_user: dict = Depends(get_current_user),
 ) -> FileResponse | JSONResponse:
     """Download session report in specified format."""
     supported = {"csv", "xlsx", "md", "json"}
@@ -829,7 +831,7 @@ async def _progress_generator(
 
 
 @router.post("/match/stream", response_model=None)
-async def run_match_stream(req: MatchRequest, request: Request) -> StreamingResponse | JSONResponse:
+async def run_match_stream(req: MatchRequest, request: Request, current_user: dict = Depends(get_current_user)) -> StreamingResponse | JSONResponse:
     """Same as POST /match but returns a Server-Sent Events stream.
 
     Use this for real-time frontend progress bars. For mobile apps,

@@ -1,7 +1,7 @@
 """Authentication and rate-limiting middleware for the API.
 
 Usage (in server.py):
-    from app.api.middleware.auth import add_api_middleware
+    from app.api.middleware import add_api_middleware
     add_api_middleware(app)
 
 This enables:
@@ -11,6 +11,7 @@ This enables:
 
 from __future__ import annotations
 
+import hmac
 import os
 import time
 from collections import defaultdict
@@ -59,7 +60,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Missing X-API-Key header"},
             )
 
-        if header_key != _API_KEY:
+        if not hmac.compare_digest(header_key, _API_KEY):
             logger.warning("Auth rejected: invalid API key | ip=%s", request.client.host if request.client else "?")
             return JSONResponse(
                 status_code=HTTP_401_UNAUTHORIZED,

@@ -8,18 +8,21 @@ Provides a production-grade HTTP API wrapping the LangGraph pipeline.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Optional
 
 import time
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from app.api.middleware import add_api_middleware
 from app.core.orchestrator import DecisionGraph
+from app.core.security import get_current_user
 from app.core.state_store import StateStore
 from app.utils.logger import logger
 
@@ -31,13 +34,32 @@ app = FastAPI(
     version="1.0.0",
 )
 
+# CORS policy:
+#   - If CORS_ALLOW_ORIGINS is set (comma-separated list), use it together
+#     with allow_credentials=True.
+#   - Otherwise fall back to a permissive "*" but with credentials DISABLED
+#     (the "*" + credentials=True combo is invalid per the CORS spec and is
+#     silently ignored/blocked by browsers).
+_cors_origins_raw = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
+if _cors_origins_raw:
+    _allow_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+    _allow_credentials = True
+else:
+    _allow_origins = ["*"]
+    _allow_credentials = False
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_allow_origins,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Service-level middleware (opt-in: API_KEY / RATE_LIMIT env vars) ─────────
+# Only activates when API_KEY and/or RATE_LIMIT are configured, so local dev
+# is unaffected. This is independent of the user JWT auth below.
+add_api_middleware(app)
 
 # ── Mount versioned API v1 ──────────────────────────────────────────────────
 from app.api.router_v1 import router as v1_router
@@ -46,6 +68,10 @@ app.include_router(v1_router)
 # ── Mount App API ──────────────────────────────────────────────────────────
 from app.api.router_app import router as app_router
 app.include_router(app_router)
+
+# ── Mount Auth API ─────────────────────────────────────────────────────────
+from app.api.router_auth import router as auth_router
+app.include_router(auth_router)
 
 # ── Global exception handlers (unified error envelope) ──────────────────────
 
@@ -75,7 +101,7 @@ async def generic_exception_handler(request: Request, exc: Exception):
         content={
             "success": False,
             "data": None,
-            "error": {"code": "INTERNAL_ERROR", "message": "Internal server error"},
+            "error": {"code": "INTERNAL_ERROR", "message": str(exc)[:500]},
             "meta": {"timestamp": time.time(), "version": "v1"},
         },
     )
@@ -166,7 +192,7 @@ async def health() -> dict:
 
 
 @app.post("/match", response_model=MatchResponse)
-async def run_match(req: MatchRequest) -> MatchResponse:
+async def run_match(req: MatchRequest, current_user: dict = Depends(get_current_user)) -> MatchResponse:
     """Execute the full job matching pipeline.
 
     Accepts job URLs and resume data, runs the 8-node LangGraph decision
@@ -205,7 +231,7 @@ async def run_match(req: MatchRequest) -> MatchResponse:
 
 
 @app.get("/sessions", response_model=list[SessionSummary])
-async def list_sessions(limit: int = Query(20, ge=1, le=200)) -> list[SessionSummary]:
+async def list_sessions(limit: int = Query(20, ge=1, le=200), current_user: dict = Depends(get_current_user)) -> list[SessionSummary]:
     """List recent sessions with basic stats."""
     store = get_store()
     rows = store.list_sessions(limit=limit)
@@ -224,7 +250,7 @@ async def list_sessions(limit: int = Query(20, ge=1, le=200)) -> list[SessionSum
 
 
 @app.get("/sessions/{session_id}")
-async def get_session(session_id: str) -> JSONResponse:
+async def get_session(session_id: str, current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """Get full session details including jobs, resume, and match results."""
     store = get_store()
     state = store.load_state(session_id)
@@ -264,6 +290,7 @@ async def get_session(session_id: str) -> JSONResponse:
 async def download_report(
     session_id: str,
     fmt: str = Query("json", description="Output format: csv, xlsx, md, json"),
+    current_user: dict = Depends(get_current_user),
 ) -> FileResponse | JSONResponse:
     """Download session report in specified format."""
     supported = {"csv", "xlsx", "md", "json"}

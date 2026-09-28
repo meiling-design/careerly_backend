@@ -73,6 +73,10 @@ app.include_router(app_router)
 from app.api.router_auth import router as auth_router
 app.include_router(auth_router)
 
+# ── Mount Careerly API (contract-aligned surface for the Flutter app) ──────
+from app.careerly.router import router as careerly_router
+app.include_router(careerly_router)
+
 # ── Global exception handlers (unified error envelope) ──────────────────────
 
 

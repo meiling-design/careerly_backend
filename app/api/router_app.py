@@ -41,10 +41,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, Depends, File, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.agents.resume_agent import ResumeAgent
+from app.core.security import get_current_user
 from app.core.state_store import StateStore
 from app.utils.logger import logger
 
@@ -109,12 +110,22 @@ _RESUMES_CACHE: dict[str, dict[str, Any]] = {}
 """In-memory cache of resume metadata, backed by JSON files in ``_RESUME_DIR``."""
 
 
-def _save_resume_meta(resume_id: str, filename: str, profile: Any) -> dict[str, Any]:
-    """Persist parsed resume metadata and return a lightweight summary."""
+def _save_resume_meta(
+    resume_id: str,
+    filename: str,
+    profile: Any,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    """Persist parsed resume metadata and return a lightweight summary.
+
+    ``user_id`` 是归属字段，只由 API 层从 JWT 注入（决策 D-F），
+    **绝不**取自请求体 —— 客户端无权指定自己属于谁。
+    """
     profile_dict = profile.model_dump() if hasattr(profile, "model_dump") else profile
     data = {
         "resume_id": resume_id,
         "name": filename,
+        "user_id": user_id,
         "profile": profile_dict,
         "created_at": time.time(),
     }
@@ -140,7 +151,10 @@ def _save_resume_meta(resume_id: str, filename: str, profile: Any) -> dict[str, 
 
 
 @router.post("/resume/upload")
-async def upload_resume(file: UploadFile = File(...)) -> JSONResponse:
+async def upload_resume(
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
+) -> JSONResponse:
     """上传并解析简历（PDF / DOCX / TXT）。
 
     流程：
@@ -163,6 +177,9 @@ async def upload_resume(file: UploadFile = File(...)) -> JSONResponse:
             }
         }
     """
+    # 归属（P0-4）：一律取自 JWT，绝不信任请求体。
+    user_id = str(current_user["id"])
+
     # ── Validate file ──────────────────────────────────────────────────
     if not file.filename:
         return _err("INVALID_FILE", "No file provided", 400)
@@ -192,7 +209,7 @@ async def upload_resume(file: UploadFile = File(...)) -> JSONResponse:
 
         # ── Persist metadata ───────────────────────────────────────────
         resume_id = f"resume_{uuid.uuid4().hex[:8]}"
-        summary = _save_resume_meta(resume_id, file.filename, profile)
+        summary = _save_resume_meta(resume_id, file.filename, profile, user_id=user_id)
 
         logger.info("Resume uploaded & parsed | id=%s | name=%s | skills=%d",
                     resume_id, file.filename, len(profile.skills))
@@ -210,7 +227,10 @@ async def upload_resume(file: UploadFile = File(...)) -> JSONResponse:
 
 
 @router.get("/tasks/{task_id}/result")
-async def get_task_result(task_id: str) -> JSONResponse:
+async def get_task_result(
+    task_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> JSONResponse:
     """获取简化后的匹配结果（App 结果页展示用）。
 
     从已有的 v1 匹配 session 中读取结果，提取 top-1 职位的
@@ -238,7 +258,9 @@ async def get_task_result(task_id: str) -> JSONResponse:
         }
     """
     store = get_store()
-    info = store.get_session_info(task_id)
+    # 归属校验（P0-4）：user_id 取自 JWT；归属不符时 get_session_info 返回 None，
+    # 于是与「任务不存在」返回**同一个** 404 —— 不泄露资源存在性（决策 D-G）。
+    info = store.get_session_info(task_id, user_id=str(current_user["id"]))
 
     if not info:
         return _err("NOT_FOUND", f"Task {task_id} not found", 404)

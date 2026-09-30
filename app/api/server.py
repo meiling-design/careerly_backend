@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.api.middleware import add_api_middleware
+from app.core.errors import AppError
 from app.core.orchestrator import DecisionGraph
 from app.core.security import get_current_user
 from app.core.state_store import StateStore
@@ -106,6 +107,29 @@ async def generic_exception_handler(request: Request, exc: Exception):
             "success": False,
             "data": None,
             "error": {"code": "INTERNAL_ERROR", "message": str(exc)[:500]},
+            "meta": {"timestamp": time.time(), "version": "v1"},
+        },
+    )
+
+
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError):
+    """把领域异常统一映射为信封格式（决策 D-G）。
+
+    ``PermissionDenied`` / ``ResourceNotFound`` 都携带 404 + ``NOT_FOUND`` ——
+    「无权访问」与「不存在」对外**不可区分**，防止通过状态码枚举他人资源。
+    这也是为什么这里不做 403 分支：那会重新引入信息泄露。
+    """
+    if exc.status_code >= 500:
+        logger.error("AppError | path=%s | code=%s | %s", request.url.path, exc.code, exc.message)
+    else:
+        logger.info("AppError | path=%s | code=%s | status=%d", request.url.path, exc.code, exc.status_code)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "data": None,
+            "error": exc.to_error_dict(),
             "meta": {"timestamp": time.time(), "version": "v1"},
         },
     )
@@ -218,6 +242,11 @@ async def run_match(req: MatchRequest, current_user: dict = Depends(get_current_
         use_embedding=req.use_embedding,
     )
 
+    # 归属补写（P0-4 / 决策 D-F）：引擎不感知用户身份，session 归属由 API 层
+    # 在运行结束后补写。用「仅认领无主 session」语义，不会覆盖他人归属。
+    if state.session_id:
+        get_store().set_session_owner_if_unowned(state.session_id, current_user["id"])
+
     top = state.match_results[0] if state.match_results else None
 
     return MatchResponse(
@@ -238,7 +267,7 @@ async def run_match(req: MatchRequest, current_user: dict = Depends(get_current_
 async def list_sessions(limit: int = Query(20, ge=1, le=200), current_user: dict = Depends(get_current_user)) -> list[SessionSummary]:
     """List recent sessions with basic stats."""
     store = get_store()
-    rows = store.list_sessions(limit=limit)
+    rows = store.list_sessions(limit=limit, user_id=str(current_user["id"]))
     return [
         SessionSummary(
             session_id=r["session_id"],
@@ -257,11 +286,13 @@ async def list_sessions(limit: int = Query(20, ge=1, le=200), current_user: dict
 async def get_session(session_id: str, current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """Get full session details including jobs, resume, and match results."""
     store = get_store()
-    state = store.load_state(session_id)
-    info = store.get_session_info(session_id)
+    # 归属校验先行（P0-4 / 决策 D-G）：归属不符与「不存在」返回同一个 404。
+    info = store.get_session_info(session_id, user_id=str(current_user["id"]))
 
     if not info:
         raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+
+    state = store.load_state(session_id)
 
     # Match results summary
     results_summary: list[dict[str, Any]] = []
@@ -303,6 +334,10 @@ async def download_report(
             status_code=400,
             detail=f"Unsupported format '{fmt}'. Supported: {', '.join(sorted(supported))}",
         )
+
+    # 归属校验（P0-4）：报告文件按 session 命名，先确认该 session 属于调用者。
+    if not get_store().get_session_info(session_id, user_id=str(current_user["id"])):
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
 
     output_dir = Path(__file__).resolve().parent.parent.parent / "data" / "outputs"
     report_file = output_dir / f"report_{session_id}.{fmt}"

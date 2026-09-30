@@ -537,9 +537,14 @@ async def run_match(req: MatchRequest, request: Request, current_user: dict = De
 
     store = get_store()
 
+    # 归属基线（P0-4）：本次请求的全部数据访问都以此为准，
+    # 绝不信任请求体里的任何用户标识。
+    user_id = str(current_user["id"])
+
     # ── Idempotency ──────────────────────────────────────────────────────
+    # 按 user 作用域查幂等键：否则两个用户提交相同输入时会互相拿到对方 session。
     idem_key = req.idempotency_key or _compute_idem_key(req)
-    existing = store.find_by_idempotency_key(idem_key)
+    existing = store.find_by_idempotency_key(idem_key, user_id=user_id)
     if existing and existing["status"] in ("pending", "running"):
         return _ok({
             "task_id": existing["session_id"],
@@ -550,12 +555,20 @@ async def run_match(req: MatchRequest, request: Request, current_user: dict = De
     # ── Create session ──────────────────────────────────────────────────
     session_id = req.session_id
     if session_id is None:
-        session_id = store.create_session({
-            "job_urls": len(req.job_urls),
-            "use_llm": req.use_llm,
-            "use_embedding": req.use_embedding,
-            "idempotency_key": idem_key,
-        })
+        # user_id 由 API 层写入持久层；引擎侧（GraphState）不携带该字段（决策 D-F）。
+        session_id = store.create_session(
+            {
+                "job_urls": len(req.job_urls),
+                "use_llm": req.use_llm,
+                "use_embedding": req.use_embedding,
+                "idempotency_key": idem_key,
+            },
+            user_id=user_id,
+        )
+    elif not store.get_session_info(session_id, user_id=user_id):
+        # 客户端显式传入的 session_id 也必须属于当前用户 ——
+        # 否则可借「续跑」语义读写他人会话（P0-4）。
+        return _err("NOT_FOUND", f"Task {session_id} not found", 404)
 
     # ── Record demo usage ──────────────────────────────────────────────
     visitor_id = _get_visitor_id(request)
@@ -588,7 +601,8 @@ async def get_task_status(task_id: str, current_user: dict = Depends(get_current
     field contains the match summary.
     """
     store = get_store()
-    info = store.get_session_info(task_id)
+    # 归属校验（P0-4 / 决策 D-G）：归属不符 → 与「不存在」返回同一个 404。
+    info = store.get_session_info(task_id, user_id=str(current_user["id"]))
 
     if not info:
         return _err("NOT_FOUND", f"Task {task_id} not found", 404)
@@ -637,7 +651,7 @@ async def get_task_status(task_id: str, current_user: dict = Depends(get_current
 async def list_tasks(limit: int = Query(20, ge=1, le=100), current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """List recent tasks (lightweight, same as /sessions)."""
     store = get_store()
-    rows = store.list_sessions(limit=limit)
+    rows = store.list_sessions(limit=limit, user_id=str(current_user["id"]))
 
     items = []
     for r in rows:
@@ -666,7 +680,7 @@ async def list_tasks(limit: int = Query(20, ge=1, le=100), current_user: dict = 
 async def list_sessions(limit: int = Query(20, ge=1, le=200), current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """List recent sessions with basic stats."""
     store = get_store()
-    rows = store.list_sessions(limit=limit)
+    rows = store.list_sessions(limit=limit, user_id=str(current_user["id"]))
 
     items = []
     for r in rows:
@@ -687,11 +701,13 @@ async def list_sessions(limit: int = Query(20, ge=1, le=200), current_user: dict
 async def get_session(session_id: str, current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """Get full session details including jobs, resume, and match results."""
     store = get_store()
-    state = store.load_state(session_id)
-    info = store.get_session_info(session_id)
+    # 归属校验先行（P0-4）：未通过时**不** load_state，避免读取他人数据。
+    info = store.get_session_info(session_id, user_id=str(current_user["id"]))
 
     if not info:
         return _err("NOT_FOUND", f"Session {session_id} not found", 404)
+
+    state = store.load_state(session_id)
 
     # Match results summary
     results_summary: list[dict[str, Any]] = []
@@ -735,6 +751,11 @@ async def download_report(
             f"Unsupported format '{fmt}'. Supported: {', '.join(sorted(supported))}",
             400,
         )
+
+    # 归属校验（P0-4）：报告文件按 session 命名，必须先确认该 session 属于调用者，
+    # 否则仅凭猜 id 即可下载他人报告。
+    if not get_store().get_session_info(session_id, user_id=str(current_user["id"])):
+        return _err("NOT_FOUND", f"Session {session_id} not found", 404)
 
     output_dir = Path(__file__).resolve().parent.parent.parent / "data" / "outputs"
     report_file = output_dir / f"report_{session_id}.{fmt}"

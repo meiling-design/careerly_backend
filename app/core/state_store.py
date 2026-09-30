@@ -53,6 +53,21 @@ class StateStore:
 
     def _init_schema(self) -> None:
         conn = _get_conn(self.db_path)
+
+        # ── Migration: sessions.user_id（架构决策 D-F / P0-4）────────────────
+        # 归属列只存在于**持久层**：由 API 层写入，引擎（LangGraph / GraphState）
+        # 对它**无感知** —— 见 create_session 的说明。
+        #
+        # CREATE TABLE IF NOT EXISTS 不会为既有库补列，故先探后 ALTER。
+        # 必须放在建索引之前，否则 idx_sessions_user 会因列不存在而失败。
+        #
+        # 历史行的 user_id 保持 NULL：`WHERE user_id = ?` 永不匹配 NULL
+        # ⇒ 旧 session 对**任意**用户都不可见（fail-closed，无需清理脚本）。
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+        if existing_cols and "user_id" not in existing_cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
+            logger.info("StateStore: migrated sessions table — added user_id column")
+
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id   TEXT PRIMARY KEY,
@@ -60,7 +75,8 @@ class StateStore:
                 updated_at   REAL NOT NULL,
                 status       TEXT NOT NULL DEFAULT 'pending',
                 config_json  TEXT NOT NULL DEFAULT '{}',
-                error_json   TEXT NOT NULL DEFAULT '[]'
+                error_json   TEXT NOT NULL DEFAULT '[]',
+                user_id      TEXT
             );
 
             CREATE TABLE IF NOT EXISTS jobs (
@@ -103,23 +119,65 @@ class StateStore:
             CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);
             CREATE INDEX IF NOT EXISTS idx_match_session ON match_results(session_id);
             CREATE INDEX IF NOT EXISTS idx_logs_session ON progress_logs(session_id);
+
+            -- 归属查询索引（P0-4）。历史行 user_id 为 NULL，索引对它们无害。
+            CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         """)
         conn.commit()
 
     # ── Session lifecycle ───────────────────────────────────────────────
 
-    def create_session(self, config: dict | None = None) -> str:
-        """Create a new session and return its ID."""
+    def create_session(self, config: dict | None = None, user_id: str | int | None = None) -> str:
+        """Create a new session and return its ID.
+
+        架构决策 D-F（2026-09-30 裁决）—— ``user_id`` 的边界：
+            持久层（本表）**有** ``user_id``，用于数据归属与用户隔离；
+            引擎层（``GraphState`` / LangGraph 节点）**不携带** ``user_id``，
+            以保持引擎逻辑纯粹、与产品身份解耦。
+            写入由 **API 层**负责（见 ``router_v1.POST /match``）。
+            引擎内部 / 离线调用（``scripts/e2e_careerly.py`` 等）不传该参数，
+            产生的行为 NULL，对**任何**用户查询均不可见（fail-closed）。
+        """
         session_id = f"session-{uuid.uuid4().hex[:12]}"
         now = time.time()
         conn = _get_conn(self.db_path)
         conn.execute(
-            "INSERT INTO sessions (session_id, created_at, updated_at, status, config_json) VALUES (?, ?, ?, ?, ?)",
-            (session_id, now, now, "pending", json.dumps(config or {}, ensure_ascii=False)),
+            "INSERT INTO sessions (session_id, created_at, updated_at, status, config_json, user_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                now,
+                now,
+                "pending",
+                json.dumps(config or {}, ensure_ascii=False),
+                None if user_id is None else str(user_id),
+            ),
         )
         conn.commit()
-        logger.info("StateStore: session created | id=%s", session_id)
+        logger.info("StateStore: session created | id=%s | user=%s", session_id, user_id)
         return session_id
+
+    def set_session_owner_if_unowned(self, session_id: str, user_id: str | int) -> bool:
+        """Claim an **unowned** session for ``user_id``; never steals ownership.
+
+        用于引擎自行创建 session 的场景（根路径 ``POST /match``）：引擎不感知
+        用户身份，故由 API 层在运行结束后补写归属。``AND user_id IS NULL``
+        保证不会覆盖他人归属 —— 若该 session 已属他人，本次调用静默无效
+        （调用方随后也读不到它，符合 fail-closed）。
+
+        Returns:
+            True 表示本次调用完成了归属写入。
+        """
+        conn = _get_conn(self.db_path)
+        cur = conn.execute(
+            "UPDATE sessions SET user_id = ?, updated_at = ? "
+            "WHERE session_id = ? AND user_id IS NULL",
+            (str(user_id), time.time(), session_id),
+        )
+        conn.commit()
+        if cur.rowcount:
+            logger.info("StateStore: session ownership claimed | id=%s | user=%s", session_id, user_id)
+        return bool(cur.rowcount)
 
     def session_exists(self, session_id: str) -> bool:
         conn = _get_conn(self.db_path)
@@ -134,14 +192,33 @@ class StateStore:
         )
         conn.commit()
 
-    def list_sessions(self, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
-        """List recent sessions with metadata."""
+    def list_sessions(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        user_id: str | int | None = None,
+    ) -> list[dict[str, Any]]:
+        """List recent sessions with metadata.
+
+        ⚠️ 归属纪律（决策 D-F）：**HTTP 路由必须传 user_id**。
+        ``user_id=None`` 表示「不做归属过滤」，仅供引擎 / 离线脚本使用。
+        ``WHERE user_id = ?`` 不会匹配历史 NULL 行 —— 这是刻意的 fail-closed，
+        **不要**改写成 ``WHERE user_id IS ?`` 或 ``OR user_id IS NULL``。
+        """
         conn = _get_conn(self.db_path)
-        rows = conn.execute(
-            "SELECT session_id, status, config_json, created_at, updated_at, error_json "
-            "FROM sessions ORDER BY created_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        ).fetchall()
+        if user_id is None:
+            sql = (
+                "SELECT session_id, status, config_json, created_at, updated_at, error_json "
+                "FROM sessions ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            )
+            params: tuple[Any, ...] = (limit, offset)
+        else:
+            sql = (
+                "SELECT session_id, status, config_json, created_at, updated_at, error_json "
+                "FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            )
+            params = (str(user_id), limit, offset)
+        rows = conn.execute(sql, params).fetchall()
         results: list[dict[str, Any]] = []
         for row in rows:
             cfg = json.loads(row["config_json"]) if row["config_json"] else {}
@@ -156,14 +233,31 @@ class StateStore:
             })
         return results
 
-    def find_by_idempotency_key(self, key: str) -> dict[str, Any] | None:
-        """Find a session by its idempotency key (stored in config_json)."""
+    def find_by_idempotency_key(
+        self,
+        key: str,
+        user_id: str | int | None = None,
+    ) -> dict[str, Any] | None:
+        """Find a session by its idempotency key (stored in config_json).
+
+        ⚠️ 归属纪律（决策 D-F）：HTTP 路由必须传 user_id。
+        否则当两个用户提交**完全相同**的简历 + 岗位组合（幂等键相同）时，
+        A 会拿到 B 的 session_id —— 这是一条真实的越权路径，
+        不只是幂等语义问题。
+        """
         conn = _get_conn(self.db_path)
-        row = conn.execute(
-            "SELECT session_id, status FROM sessions WHERE config_json LIKE ? "
-            "ORDER BY created_at DESC LIMIT 1",
-            (f"%{key}%",),
-        ).fetchone()
+        if user_id is None:
+            row = conn.execute(
+                "SELECT session_id, status FROM sessions WHERE config_json LIKE ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (f"%{key}%",),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT session_id, status FROM sessions "
+                "WHERE user_id = ? AND config_json LIKE ? ORDER BY created_at DESC LIMIT 1",
+                (str(user_id), f"%{key}%"),
+            ).fetchone()
         if not row:
             return None
         return {"session_id": row["session_id"], "status": row["status"]}
@@ -438,14 +532,31 @@ class StateStore:
 
     # ── Session info ────────────────────────────────────────────────────
 
-    def get_session_info(self, session_id: str) -> dict[str, Any] | None:
-        """Return session metadata (status, config, timestamps) or None."""
+    def get_session_info(
+        self,
+        session_id: str,
+        user_id: str | int | None = None,
+    ) -> dict[str, Any] | None:
+        """Return session metadata (status, config, timestamps) or None.
+
+        ⚠️ 归属纪律（决策 D-F）：**HTTP 路由必须传 user_id**。
+        传了 user_id 但归属不符时返回 ``None`` —— 调用方据此返回 404，
+        与「资源不存在」不可区分（决策 D-G：不泄露资源存在性，防 id 枚举）。
+        ``user_id=None`` 表示不做归属过滤，仅供引擎 / 离线脚本使用。
+        """
         conn = _get_conn(self.db_path)
-        row = conn.execute(
-            "SELECT session_id, status, config_json, created_at, updated_at, error_json "
-            "FROM sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
+        if user_id is None:
+            row = conn.execute(
+                "SELECT session_id, status, config_json, created_at, updated_at, error_json "
+                "FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT session_id, status, config_json, created_at, updated_at, error_json "
+                "FROM sessions WHERE session_id = ? AND user_id = ?",
+                (session_id, str(user_id)),
+            ).fetchone()
         if not row:
             return None
         return {

@@ -230,3 +230,18 @@ def test_app_error_handler_emits_unified_envelope(client: TestClient) -> None:
             r for r in server_module.app.router.routes
             if getattr(r, "path", None) != "/__p0_test_permission_denied"
         ]
+
+
+# ── 8. P0-6：DEV 认证不得在「非 DEV 形态」下签发 token ──────────────────────
+
+
+def test_login_refuses_when_dev_auth_is_disabled(client: TestClient, monkeypatch) -> None:
+    """AUTH_MODE=formal 时手机号直登端点应如实拒绝（501），而不是照常签发 token。
+
+    这是 P0-6 的运行时那一半：启动检查保证「生产 + DEV」配置起不来，
+    本测试保证「非 DEV 形态」下那条无凭证登录路径确实被关掉。
+    """
+    monkeypatch.setenv("AUTH_MODE", "formal")
+    resp = client.post("/api/v1/auth/login", json={"phone": "13800000091"})
+    assert resp.status_code == 501, resp.text
+    assert resp.json()["error"]["code"] == "AUTH_MODE_UNAVAILABLE"

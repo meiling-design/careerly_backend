@@ -232,7 +232,26 @@ def test_app_error_handler_emits_unified_envelope(client: TestClient) -> None:
         ]
 
 
-# ── 8. P0-6：DEV 认证不得在「非 DEV 形态」下签发 token ──────────────────────
+# ── 8. P0-3：Auth 链路闭环（register → login → /me）─────────────────────────
+
+
+def test_auth_me_resolves_the_token_owner(client: TestClient) -> None:
+    """P0-3：用注册/登录拿到的真实 JWT 访问 /auth/me，必须解析出**本人**。
+
+    这条把 Auth 链路的两端接上了：token 是登录发的，身份是 /me 解的。
+    若中间任何一环（token 签发 / 解码 / subject → user 查询）错位，都会在这里暴露。
+    """
+    headers = _register_and_login(client, "13800000041", "User A")
+
+    resp = client.get("/api/v1/auth/me", headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["user"]["phone"] == "13800000041"
+
+    # 同一端点在无 token 时必须是 401（回归：别把它变成公开端点）
+    assert client.get("/api/v1/auth/me").status_code == 401
+
+
+# ── 9. P0-6：DEV 认证不得在「非 DEV 形态」下签发 token ──────────────────────
 
 
 def test_login_refuses_when_dev_auth_is_disabled(client: TestClient, monkeypatch) -> None:

@@ -20,6 +20,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -138,9 +139,29 @@ class CareerlyStore:
                 is_member INTEGER NOT NULL DEFAULT 0
             );
 
+            -- P1-1a：分析任务的运行记录。
+            -- ⚠️ 这是「这一次分析跑到哪了」的可观测记录，不是业务数据本体
+            -- （业务本体在 analysis_projects）。D-A ②双模的第一阶段：
+            -- 对外 POST /analysis 仍同步返回结果，仅内部留痕。
+            CREATE TABLE IF NOT EXISTS analysis_tasks (
+                id            TEXT PRIMARY KEY,
+                user_id       INTEGER NOT NULL,
+                project_id    TEXT,               -- 成功后回填，失败为 NULL
+                status        TEXT NOT NULL,      -- queued|processing|completed|failed
+                title         TEXT NOT NULL DEFAULT '',
+                source        TEXT NOT NULL DEFAULT 'paste',
+                error_code    TEXT,               -- status=failed 时
+                error_message TEXT,
+                created_at    REAL NOT NULL,
+                started_at    REAL,
+                finished_at   REAL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_projects_user ON analysis_projects(user_id);
             CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id);
             CREATE INDEX IF NOT EXISTS idx_results_project ON analysis_results(project_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_user ON analysis_tasks(user_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON analysis_tasks(status);
         """)
         conn.commit()
 
@@ -324,6 +345,99 @@ class CareerlyStore:
             (user_id,),
         )
         conn.commit()
+
+    # ── Analysis tasks (P1-1a) ──────────────────────────────────────────
+    #
+    # 状态机：queued → processing → completed | failed
+    #
+    # 设计约束：
+    #  - 任务记录**只服务可观测**，不作为业务真相；结果仍以 analysis_projects 为准。
+    #  - 每个方法都带 user_id 或不带（内部流转用 task_id），但**读**一律按 user 作用域。
+    #  - 失败必须落 error_code / error_message —— 「失败无痕」是 P1-2 要消灭的对象。
+
+    TASK_QUEUED = "queued"
+    TASK_PROCESSING = "processing"
+    TASK_COMPLETED = "completed"
+    TASK_FAILED = "failed"
+
+    def create_task(self, user_id: int, title: str, source: str = "paste") -> str:
+        """Insert a ``queued`` task and return its id."""
+        task_id = f"task_{uuid.uuid4().hex[:16]}"
+        conn = _get_conn(self.db_path)
+        conn.execute(
+            "INSERT INTO analysis_tasks (id, user_id, project_id, status, title, source, "
+            " error_code, error_message, created_at, started_at, finished_at) "
+            "VALUES (?, ?, NULL, ?, ?, ?, NULL, NULL, ?, NULL, NULL)",
+            (task_id, user_id, self.TASK_QUEUED, title.strip(), source, time.time()),
+        )
+        conn.commit()
+        return task_id
+
+    def start_task(self, task_id: str) -> None:
+        conn = _get_conn(self.db_path)
+        conn.execute(
+            "UPDATE analysis_tasks SET status = ?, started_at = ? "
+            "WHERE id = ? AND status = ?",
+            (self.TASK_PROCESSING, time.time(), task_id, self.TASK_QUEUED),
+        )
+        conn.commit()
+
+    def complete_task(self, task_id: str, project_id: str) -> None:
+        conn = _get_conn(self.db_path)
+        conn.execute(
+            "UPDATE analysis_tasks SET status = ?, project_id = ?, finished_at = ?, "
+            " error_code = NULL, error_message = NULL WHERE id = ?",
+            (self.TASK_COMPLETED, project_id, time.time(), task_id),
+        )
+        conn.commit()
+
+    def fail_task(self, task_id: str, error_code: str, error_message: str) -> None:
+        conn = _get_conn(self.db_path)
+        conn.execute(
+            "UPDATE analysis_tasks SET status = ?, finished_at = ?, error_code = ?, "
+            " error_message = ? WHERE id = ?",
+            (self.TASK_FAILED, time.time(), error_code, error_message[:2000], task_id),
+        )
+        conn.commit()
+
+    def get_task(self, user_id: int, task_id: str) -> Optional[dict[str, Any]]:
+        """Ownership-scoped read. Never filter by ``OR user_id IS NULL``."""
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT * FROM analysis_tasks WHERE id = ? AND user_id = ?",
+            (task_id, user_id),
+        ).fetchone()
+        return self._task_row(row) if row else None
+
+    def list_tasks(self, user_id: int, limit: int = 50) -> list[dict[str, Any]]:
+        conn = _get_conn(self.db_path)
+        rows = conn.execute(
+            "SELECT * FROM analysis_tasks WHERE user_id = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (user_id, min(max(limit, 1), 200)),
+        ).fetchall()
+        return [self._task_row(r) for r in rows]
+
+    @staticmethod
+    def _task_row(row: sqlite3.Row) -> dict[str, Any]:
+        started = row["started_at"]
+        finished = row["finished_at"]
+        duration_ms = (
+            int((finished - started) * 1000) if started and finished else None
+        )
+        return {
+            "taskId": row["id"],
+            "status": row["status"],
+            "projectId": row["project_id"],
+            "title": row["title"],
+            "source": row["source"],
+            "errorCode": row["error_code"],
+            "errorMessage": row["error_message"],
+            "createdAt": iso(row["created_at"]),
+            "startedAt": iso(started) if started else None,
+            "finishedAt": iso(finished) if finished else None,
+            "durationMs": duration_ms,
+        }
 
     # ── helpers ─────────────────────────────────────────────────────────
 

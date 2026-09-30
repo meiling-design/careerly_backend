@@ -225,9 +225,11 @@ def run_analysis(
     from app.core.orchestrator import DecisionGraph
 
     if not resume_text or not resume_text.strip():
+        # P1-2：语义从「缺少一份文件」改为「尚未建立职业基线」——
+        # 后者才是 Careerly 的产品语言（基线 = 后续所有 Gap / 成长的参照系）。
         raise AnalysisError(
-            "NO_RESUME",
-            "尚未建立职业基线（缺少简历文本），无法进行岗位分析",
+            "NO_BASELINE",
+            "尚未建立职业基线：请先上传简历或传入 resumeText",
             422,
         )
 
@@ -245,6 +247,18 @@ def run_analysis(
     except Exception as exc:  # pragma: no cover - engine-level failure
         logger.exception("Careerly analysis failed: %s", exc)
         raise AnalysisError("ANALYSIS_FAILED", f"分析失败：{exc}", 502) from exc
+
+    # P1-2：RoutingNode 判定「数据不足、需人工介入」时，图会直接走向 END
+    # （orchestrator.py:157 "ask_user" -> END），此时 match_results 为空。
+    # 这**不是**系统故障，不能和 ANALYSIS_EMPTY 混为一谈 —— 前端需要据此
+    # 提示用户补充信息，而不是显示「分析失败」。
+    if getattr(state, "routing_decision", "") == "ask_user":
+        reason = (getattr(state, "routing_reason", "") or "").strip()
+        raise AnalysisError(
+            "NEED_MORE_INPUT",
+            reason or "信息不足，无法完成分析：请补充更完整的岗位描述或简历内容",
+            422,
+        )
 
     results: list[MatchResult] = list(state.match_results or [])
     if not results:

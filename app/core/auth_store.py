@@ -89,6 +89,59 @@ class AuthStore:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)"
         )
 
+        # ── Legacy NOT NULL constraints (pre-D85) ───────────────────────
+        # Databases created before the phone-identity switch declared
+        # ``email TEXT NOT NULL`` and ``password_hash TEXT NOT NULL``.
+        # ``CREATE TABLE IF NOT EXISTS`` is a no-op on those files and SQLite
+        # cannot relax a NOT NULL constraint in place, so registering a
+        # phone-only user failed with "NOT NULL constraint failed: users.email".
+        # The only way out is to rebuild the table with the current schema.
+        info = {row["name"]: row for row in conn.execute("PRAGMA table_info(users)")}
+        legacy_email = info.get("email")
+        legacy_pwd = info.get("password_hash")
+        if (legacy_email is not None and legacy_email["notnull"]) or (
+            legacy_pwd is not None and legacy_pwd["notnull"]
+        ):
+            self._rebuild_users(conn)
+
+    @staticmethod
+    def _rebuild_users(conn: sqlite3.Connection) -> None:
+        """Recreate ``users`` with the current schema, preserving every row.
+
+        Legacy rows created under the email+password identity have no phone
+        number. Under D85 (``login(phone)``) they are unreachable anyway, but
+        they are **kept** rather than dropped: each gets a unique placeholder
+        phone so the UNIQUE NOT NULL constraint holds.
+        """
+        conn.executescript(
+            """
+            CREATE TABLE users_new (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone         TEXT UNIQUE NOT NULL,
+                name          TEXT NOT NULL DEFAULT '',
+                email         TEXT UNIQUE,
+                password_hash TEXT,
+                is_active     INTEGER NOT NULL DEFAULT 1,
+                created_at    REAL NOT NULL,
+                updated_at    REAL NOT NULL
+            );
+            INSERT INTO users_new
+                (id, phone, name, email, password_hash, is_active, created_at, updated_at)
+            SELECT id,
+                   COALESCE(NULLIF(TRIM(COALESCE(phone, '')), ''), 'legacy_' || id),
+                   COALESCE(name, ''),
+                   email,
+                   password_hash,
+                   COALESCE(is_active, 1),
+                   created_at,
+                   updated_at
+            FROM users;
+            DROP TABLE users;
+            ALTER TABLE users_new RENAME TO users;
+            """
+        )
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)")
+
     # ── Create ───────────────────────────────────────────────────────────
 
     def create_user(self, phone: str, name: str = "", email: str | None = None) -> int:

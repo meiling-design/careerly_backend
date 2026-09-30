@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="In3FbirT5pglrfeuyV7hYM">
+<head data-page-node-id="deApboH45O9pyzFaljwOMR">
+<meta charset="UTF-8" data-page-node-id="6w9F9ncnJ2Oz2do00KrZYQ">
+<meta name="viewport" content="width=device-width, initial-scale=1" data-page-node-id="JkMOsLOq3CmeB57opyTNqD">
+<title>Careerly Backend × Job Matching Agent — 整合架构审计可视化指南</title>
+<style>
+  :root {
+    --bg: #FBFAF7;
+    --surface: #FFFFFF;
+    --border: rgba(0,0,0,0.12);
+    --border-soft: rgba(0,0,0,0.06);
+    --text: #1F1E1C;
+    --text-2: #5F5E5A;
+    --text-3: #8A8880;
+    --accent: #534AB7;
+    --danger: #A32D2D;
+    --danger-bg: #FCEBEB;
+    --warn: #854F0B;
+    --warn-bg: #FAEEDA;
+    --ok: #0F6E56;
+    --ok-bg: #E1F5EE;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1A1917;
+      --surface: #232220;
+      --border: rgba(255,255,255,0.16);
+      --border-soft: rgba(255,255,255,0.08);
+      --text: #F0EEE9;
+      --text-2: #B4B2A9;
+      --text-3: #888780;
+      --accent: #AFA9EC;
+      --danger: #F09595;
+      --danger-bg: #3A1A1A;
+      --warn: #EF9F27;
+      --warn-bg: #3A2C12;
+      --ok: #5DCAA5;
+      --ok-bg: #123029;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 40px 24px 72px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 780px; margin: 0 auto; }
+  header { padding-bottom: 28px; border-bottom: 1px solid var(--border); margin-bottom: 36px; }
+  h1 { font-size: 22px; font-weight: 500; margin: 0 0 10px; letter-spacing: -0.2px; }
+  .meta { font-size: 13px; color: var(--text-3); }
+  .meta span + span::before { content: " · "; margin: 0 4px; }
+  .lede {
+    margin: 20px 0 0;
+    padding: 16px 18px;
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    font-size: 14px;
+    color: var(--text-2);
+  }
+  .lede strong { color: var(--text); font-weight: 500; }
+  section { margin-bottom: 44px; }
+  h2 { font-size: 16px; font-weight: 500; margin: 0 0 6px; }
+  h2 .num {
+    display: inline-block;
+    width: 22px; height: 22px;
+    margin-right: 8px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    font-size: 12px;
+    text-align: center;
+    line-height: 22px;
+    vertical-align: 2px;
+  }
+  .sub { font-size: 13px; color: var(--text-3); margin: 0 0 18px 30px; }
+  .fig {
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-radius: 12px;
+    padding: 20px;
+    overflow-x: auto;
+  }
+  .fig svg { display: block; width: 100%; height: auto; min-width: 520px; }
+  .note {
+    margin-top: 14px;
+    font-size: 13px;
+    color: var(--text-2);
+  }
+  .note b { font-weight: 500; color: var(--text); }
+  .takeaways { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border-soft);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .card .k { font-size: 12px; color: var(--text-3); margin-bottom: 6px; }
+  .card .v { font-size: 20px; font-weight: 500; margin-bottom: 4px; }
+  .card .d { font-size: 12px; color: var(--text-2); line-height: 1.5; }
+  .card.is-danger .v { color: var(--danger); }
+  .card.is-ok .v { color: var(--ok); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+  th { font-weight: 500; color: var(--text-3); font-size: 12px; letter-spacing: 0.3px; }
+  td code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    background: var(--border-soft);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .tag {
+    display: inline-block;
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 20px;
+    white-space: nowrap;
+  }
+  .tag.d { background: var(--danger-bg); color: var(--danger); }
+  .tag.w { background: var(--warn-bg); color: var(--warn); }
+  .tag.o { background: var(--ok-bg); color: var(--ok); }
+  ul.rules { margin: 0; padding-left: 20px; }
+  ul.rules li { margin-bottom: 12px; font-size: 13px; color: var(--text-2); }
+  ul.rules li b { color: var(--text); font-weight: 500; }
+  footer { margin-top: 52px; padding-top: 22px; border-top: 1px solid var(--border); font-size: 12px; color: var(--text-3); }
+</style>
+</head>
+<body data-page-node-id="T1BSkAsvmNbQWQ9eKAvr8v">
+<div class="wrap" data-page-node-id="KTkiInUraA6ovMccp7f2Gc">
+
+<header data-page-node-id="dS0apHGRpBNTRfh6GwiF6G">
+  <h1 data-page-node-id="1RSiQnv9CH1u9rSjORkTQw">Careerly Backend × Job Matching Agent 整合架构审计</h1>
+  <div class="meta" data-page-node-id="6dNfO6VCp4sKhLbJLJGSMf">
+    <span data-page-node-id="il5MATKjuVSsZKYfgLTJG2">可视化指南</span>
+    <span data-page-node-id="LjPacS7N8uXZfOG9xNPD1l">2026-09-30</span>
+    <span data-page-node-id="BzRiiXHBYhigWP4I3xYOqJ">work_agent + careerly</span>
+  </div>
+  <div class="lede" data-page-node-id="o67MBQvFijWl3cxf41BuNC">
+    审计推翻了任务书里的一个核心前提：<strong data-page-node-id="tIdRT2kXC5IB1hGHO3qggc">不存在「两个项目需要整合」</strong>。
+    Careerly 的后端层早已长在 <code data-page-node-id="NiRksriAKTktkuFvJKGYND">work_agent</code> 仓库内部，Agent 适配层也在位。
+    真正要做的不是「合并」或「重建适配层」，而是<strong data-page-node-id="LgFkOZQuvEdBAgLKQaVlaD">收敛边界、补齐缺口、把端到端跑通</strong>。
+  </div>
+</header>
+
+<section data-page-node-id="wtH8LFjs8EwdBhVFmpwZJX">
+  <h2 data-page-node-id="pAu4rA6jj5k9VLAdKeVwHG"><span class="num" data-page-node-id="zIoqo0OpohoS14VUfkXFZU">1</span>三层架构：已物理共存于单仓库</h2>
+  <p class="sub" data-page-node-id="HZWe2hHk1uXY5a6HfrARhP">一个 FastAPI 进程，三个逻辑层，两个独立数据库。不需要第二套服务。</p>
+  <div class="fig" data-page-node-id="zXkzTBLwLmhgSXsCPaJ9mt">
+    <svg viewBox="0 0 680 492" width="100%" role="img" style="font-family:inherit" xmlns="http://www.w3.org/2000/svg" data-page-node-id="lVlBu4nAHp1FzAc7PPDPGZ">
+      <title>Careerly 三层架构现状</title>
+      <desc data-page-node-id="FePxKJB3pb5BNbvqHk0t2Q">Flutter App 经 HTTPS 调用 work_agent 单进程内的 L3 API 层、L2 适配层、L1 引擎层，底部并列 careerly.db 与 graph_state.db。</desc>
+      <defs data-page-node-id="1Dd9ILNIJ9u2ZPiNUw3CHS">
+        <marker id="g1a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse" data-page-node-id="gUppxVWeRAyzZOHQi2Zi56">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="1xOw3Bm8XGkyVliCuDQPTX"/>
+        </marker>
+      </defs>
+      <rect x="140" y="40" width="400" height="56" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5" data-page-node-id="tVqEDxN4hL4fGNXOR0ocNf"/>
+      <text x="340" y="62" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#042C53" data-page-node-id="76J5CR3hvkFpLMQuOmp38g">Careerly Flutter App</text>
+      <text x="340" y="80" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5" data-page-node-id="AtiAebciok3xc5m6mmhF7p">auth / analysis / resume 已接真实后端</text>
+      <line x1="340" y1="96" x2="340" y2="119" stroke="#185FA5" stroke-width="1.5" marker-end="url(#g1a)" data-page-node-id="5tB0jKqHc4FQ25BSKLE4Zs"/>
+      <text x="352" y="107" dominant-baseline="central" font-size="11" fill="#5F5E5A" data-page-node-id="dr1YyfHnrFSEqCH1FyHjhv">HTTPS / JSON</text>
+      <rect x="40" y="120" width="600" height="352" rx="12" fill="none" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="5 4" data-page-node-id="0HGiIdihgY80qTjpLC6Vig"/>
+      <text x="60" y="142" dominant-baseline="central" font-size="13" fill="#5F5E5A" data-page-node-id="KeNioCe2vgFNAXLaKLwNyo">work_agent · 单进程 FastAPI · 三层已物理共存</text>
+      <rect x="60" y="152" width="560" height="54" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="0.5" data-page-node-id="BcaE9F5HNcduPVXz7gLFEC"/>
+      <text x="340" y="172" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#26215C" data-page-node-id="DSMWP3zQh71TXUvFDXWUd3">L3 API 层 · app/api/</text>
+      <text x="340" y="190" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#534AB7" data-page-node-id="QfSrBFltSzhGglO6yn0WMs">server.py · envelope · router_* · JWT 鉴权</text>
+      <line x1="340" y1="206" x2="340" y2="225" stroke="#888780" stroke-width="1.5" marker-end="url(#g1a)" data-page-node-id="7kdDHWdBAqrdyJL0AJHZu7"/>
+      <rect x="60" y="226" width="560" height="54" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5" data-page-node-id="pQOWHoYjKGnV6hM4hQNGzD"/>
+      <text x="340" y="246" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#04342C" data-page-node-id="UXzoq7yIzxmmgSdqlkTEFl">L2 适配层 · app/careerly/</text>
+      <text x="340" y="264" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#0F6E56" data-page-node-id="9CG6ceQ3hVHB1QTuhyGU6w">engine.py（Agent Adapter）· capability · store · schemas</text>
+      <line x1="340" y1="280" x2="340" y2="299" stroke="#888780" stroke-width="1.5" marker-end="url(#g1a)" data-page-node-id="M5VpSYfyoQ6CWVhEd6ZAKd"/>
+      <text x="352" y="289" dominant-baseline="central" font-size="11" fill="#5F5E5A" data-page-node-id="aNhHlygpE7tyOp2YbsN2Eq">进程内方法调用</text>
+      <rect x="60" y="300" width="560" height="72" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5" data-page-node-id="asWUg7gdxieVfAxUnzD3Jm"/>
+      <text x="340" y="320" text-anchor="middle" dominant-baseline="central" font-size="14" font-weight="500" fill="#412402" data-page-node-id="NDD77wG5uLIttrES0OXuT3">L1 引擎层 · app/core + app/agents/</text>
+      <text x="340" y="340" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#854F0B" data-page-node-id="RztDgmyaLar5YthgOhD2Hf">DecisionGraph · LangGraph 8 节点</text>
+      <text x="340" y="358" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#BA7517" data-page-node-id="y7IblRUbPaptoyPRNs3hxc">crawl → normalize → resume_embed → routing → match → rank → report</text>
+      <line x1="195" y1="372" x2="195" y2="391" stroke="#888780" stroke-width="1.5" marker-end="url(#g1a)" data-page-node-id="RDzgbhBbgj8UNRLqoXjZw1"/>
+      <line x1="485" y1="372" x2="485" y2="391" stroke="#888780" stroke-width="1.5" marker-end="url(#g1a)" data-page-node-id="KolBek2NaQABr8HbenwDiu"/>
+      <rect x="60" y="392" width="270" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5" data-page-node-id="jB9Z5FhXmY8JNpxANgn3gB"/>
+      <text x="195" y="412" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#2C2C2A" data-page-node-id="MeTVVWoAX0jFL8DWWwCMl9">careerly.db · 业务真相</text>
+      <text x="195" y="431" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A" data-page-node-id="1YW1R65grsUXFLjakLDIwx">7 表 · 全 user_id 隔离 · 需备份</text>
+      <rect x="350" y="392" width="270" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5" data-page-node-id="3xxVFIdkYuHS0VobtRMDxg"/>
+      <text x="485" y="412" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#2C2C2A" data-page-node-id="wtdKNTyCbrkFYT9WNKStqb">graph_state.db · 引擎运行态</text>
+      <text x="485" y="431" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#5F5E5A" data-page-node-id="bN3eSma8Cn6QIxjRHRV04r">5 表 · 无 user_id · 可丢弃</text>
+    </svg>
+  </div>
+  <p class="note" data-page-node-id="KbzDVEInBxP1tqwPCGj5dL">
+    <b data-page-node-id="VAfllDlwNIFkTIgXrWLKB0">关键点</b>：L2 → L1 是进程内方法调用，<b data-page-node-id="gbHGLjV18WmmJUz3B865EJ">不是 HTTP</b>。不要为了方便把引擎拆成独立服务 —— 同一进程内再走一次 HTTP 往返，只增加延迟和故障面。
+  </p>
+</section>
+
+<section data-page-node-id="b6fZ2CUE69ljdnQRrk8gW4">
+  <h2 data-page-node-id="0TQqxw88V3R8Opvt7zCyff"><span class="num" data-page-node-id="oK1KB1CnOeTJLYmDpxPBcE">2</span>八项缺口：真正要动手的地方</h2>
+  <p class="sub" data-page-node-id="FXDoQvCHYxiJvgDx5FSDEd">按严重度分级。三项阻断必须先修，其余按路线推进。</p>
+  <div class="fig" data-page-node-id="EO19EUntBSiRzL2vHkOLHK">
+    <svg viewBox="0 0 680 296" width="100%" role="img" style="font-family:inherit" xmlns="http://www.w3.org/2000/svg" data-page-node-id="XAlx09Zf7jNKOBnJpCTdsc">
+      <title>审计发现的八项缺口</title>
+      <desc data-page-node-id="vMuAJVgOJ3SCgPcd85Kknv">按严重度分为三级：阻断级三项、重要三项、技术债两项。</desc>
+      <circle cx="46" cy="40" r="4" fill="#E24B4A" data-page-node-id="0XAt6s3SbJTLKiwDHXDbBp"/>
+      <text x="58" y="40" dominant-baseline="central" font-size="13" font-weight="500" fill="#A32D2D" data-page-node-id="SiR7GOd6PwiI9P1ycvarzt">阻断级 · 3 项</text>
+      <circle cx="251" cy="40" r="4" fill="#EF9F27" data-page-node-id="Ls77vFuPNOLmR78DlptR1t"/>
+      <text x="263" y="40" dominant-baseline="central" font-size="13" font-weight="500" fill="#854F0B" data-page-node-id="01UsmodJ4y6SkbDt1b0N7N">重要 · 3 项</text>
+      <circle cx="456" cy="40" r="4" fill="#888780" data-page-node-id="gGaKUxhsKsClhmBajt7A69"/>
+      <text x="468" y="40" dominant-baseline="central" font-size="13" font-weight="500" fill="#5F5E5A" data-page-node-id="YfDFQ6OGQwNYAiWhq26Ge1">技术债 · 2 项</text>
+      <rect x="40" y="60" width="190" height="64" rx="8" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5" data-page-node-id="HeTJU8Hqxdf2CeB2eE6rxf"/>
+      <text x="52" y="82" dominant-baseline="central" font-size="13" font-weight="500" fill="#501313" data-page-node-id="iMAfYmrlSo13j5urilL3pE">G1 App 连不上后端</text>
+      <text x="52" y="103" dominant-baseline="central" font-size="12" fill="#A32D2D" data-page-node-id="DuKnJADEiGKNzHNMGEr4z5">无 INTERNET 权限</text>
+      <rect x="40" y="136" width="190" height="64" rx="8" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5" data-page-node-id="IJX7mJisv2JFh1Yh001Gi1"/>
+      <text x="52" y="158" dominant-baseline="central" font-size="13" font-weight="500" fill="#501313" data-page-node-id="0zF9aPO8dYZX6hZgvF3pRS">G2 越权访问</text>
+      <text x="52" y="179" dominant-baseline="central" font-size="12" fill="#A32D2D" data-page-node-id="W8lA60WynvcQw7r7W973Dg">端点无鉴权 · 无归属校验</text>
+      <rect x="40" y="212" width="190" height="64" rx="8" fill="#FCEBEB" stroke="#A32D2D" stroke-width="0.5" data-page-node-id="bmyI9wznEpmnAhvisWS9Wh"/>
+      <text x="52" y="234" dominant-baseline="central" font-size="13" font-weight="500" fill="#501313" data-page-node-id="icqAH0wk0KIGjgqLmhItyC">G3 成长无法闭环</text>
+      <text x="52" y="255" dominant-baseline="central" font-size="12" fill="#A32D2D" data-page-node-id="nCIc1Rhf6gfR2Q6fPcNgYY">缺能力快照时序表</text>
+      <rect x="245" y="60" width="190" height="64" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5" data-page-node-id="bKYwTjRasDJmt1Dct4kIJT"/>
+      <text x="257" y="82" dominant-baseline="central" font-size="13" font-weight="500" fill="#412402" data-page-node-id="w0GuhngxbPVCn1akH3O98w">G4 同步分析超时风险</text>
+      <text x="257" y="103" dominant-baseline="central" font-size="12" fill="#854F0B" data-page-node-id="YSa3pnjMfWPOKSPFx4DUEg">210s 阻塞 vs 300s 超时</text>
+      <rect x="245" y="136" width="190" height="64" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5" data-page-node-id="BdLChzp1MphwxuMDqwCkBq"/>
+      <text x="257" y="158" dominant-baseline="central" font-size="13" font-weight="500" fill="#412402" data-page-node-id="RuIUkeyzVHfXW3h7WXVEjs">G5 API 表面重复</text>
+      <text x="257" y="179" dominant-baseline="central" font-size="12" fill="#854F0B" data-page-node-id="HEClNO50FDScfDEpcieMGa">根路径与 /api/v1 并存</text>
+      <rect x="245" y="212" width="190" height="64" rx="8" fill="#FAEEDA" stroke="#854F0B" stroke-width="0.5" data-page-node-id="KeF25sA9HKUf3Opusy8eI6"/>
+      <text x="257" y="234" dominant-baseline="central" font-size="13" font-weight="500" fill="#412402" data-page-node-id="bsjCoGk5j4FVjHFS4BfW2V">G6 token 不落盘</text>
+      <text x="257" y="255" dominant-baseline="central" font-size="12" fill="#854F0B" data-page-node-id="u2GDp07TyuDZ0SkkERAsWL">冷启动即失忆（D52）</text>
+      <rect x="450" y="60" width="190" height="64" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5" data-page-node-id="gYB0fQYAFLfRuvr5NDAuLi"/>
+      <text x="462" y="82" dominant-baseline="central" font-size="13" font-weight="500" fill="#2C2C2A" data-page-node-id="cvgwyjEnQcgA3xPdrVYJnU">G7 引擎技术债</text>
+      <text x="462" y="103" dominant-baseline="central" font-size="12" fill="#5F5E5A" data-page-node-id="u2smX2iIGPFMxlA4Wc0qto">并发池未接线 · 无断点续跑</text>
+      <rect x="450" y="136" width="190" height="64" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="0.5" data-page-node-id="zZCTpzBkGqbPFho1Ipncei"/>
+      <text x="462" y="158" dominant-baseline="central" font-size="13" font-weight="500" fill="#2C2C2A" data-page-node-id="r9xTgSPqeGFsLGsu0gctYl">G8 测试覆盖薄</text>
+      <text x="462" y="179" dominant-baseline="central" font-size="12" fill="#5F5E5A" data-page-node-id="xx7DoGlGmG6oQZoL5HY5yU">仅规则与纯函数测试</text>
+      <rect x="450" y="212" width="190" height="64" rx="8" fill="none" stroke="#B4B2A9" stroke-width="0.5" stroke-dasharray="4 3" data-page-node-id="b8lqekiLHC2OPnLtqOeivl"/>
+      <text x="462" y="234" dominant-baseline="central" font-size="13" font-weight="500" fill="#444441" data-page-node-id="QlYdr133jk9ZQQvWAIaU8d">26 个模块 · 18 复用</text>
+      <text x="462" y="255" dominant-baseline="central" font-size="12" fill="#888780" data-page-node-id="GkS12GXLkvRQ0neYWaTB6r">0 重写 · 0 删除</text>
+    </svg>
+  </div>
+  <p class="note" data-page-node-id="ONMquO5eKkEWPNeaINmnAK">
+    <b data-page-node-id="1hA39taHOpihSHETIFgYrx">G3 最易被低估</b>：Careerly 的核心表达是「看见成长」，而成长 = 相邻两次能力快照的 diff。
+    当前 <span class="mono" data-page-node-id="xqENDoPMjwOilyjOND5Yxm">capability_snapshot</span> 只是 <span class="mono" data-page-node-id="1saTiBrFBW9QcWA8qdaGGI">analysis_results</span> 的一个 JSON 列，
+    没有跨项目的时间序列，产品就只剩「一次分析」，长不出「成长」这条线。
+  </p>
+</section>
+
+<section data-page-node-id="erqJoPAzzMdDif9cl54G7Z">
+  <h2 data-page-node-id="GSYYAsr8FMALvLGyqBpNXB"><span class="num" data-page-node-id="BPyVPIex1sKy5xLUC2XqoA">3</span>双库边界：过程 vs 结果</h2>
+  <p class="sub" data-page-node-id="nC9d8MTP2UQru6KE1xAnwZ">一个可丢弃，一个必须备份。判据比文档更管用。</p>
+  <div class="fig" data-page-node-id="6ubGIN7GHUJzQ60ZK9yACU">
+    <svg viewBox="0 0 680 270" width="100%" role="img" style="font-family:inherit" xmlns="http://www.w3.org/2000/svg" data-page-node-id="V5BHRcZ0aVHMTAinAHYcKC">
+      <title>两个 SQLite 的职责边界</title>
+      <desc data-page-node-id="aZRD4vBdEJRhnrcmrB8bII">graph_state.db 存引擎运行态、可随时清空；careerly.db 存业务真相、需永久保留。</desc>
+      <defs data-page-node-id="WhRJiSlaaIs694ZNi8LkLV">
+        <marker id="g3a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse" data-page-node-id="vGpdBGgOEBHRkFd30lebnm">
+          <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" data-page-node-id="NkQDlZzDhHA3mNzfQ9TYpo"/>
+        </marker>
+      </defs>
+      <rect x="40" y="50" width="270" height="200" rx="12" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5" data-page-node-id="SPkrtnilUYKTHRVDS4pAyS"/>
+      <text x="60" y="78" dominant-baseline="central" font-size="14" font-weight="500" fill="#2C2C2A" data-page-node-id="WOmCSCdz6qcAC87dirXV8G">graph_state.db</text>
+      <text x="60" y="100" dominant-baseline="central" font-size="12" fill="#5F5E5A" data-page-node-id="p45YTEvviRQfjHbe284CKU">引擎运行态 · 可随时清空</text>
+      <line x1="60" y1="116" x2="290" y2="116" stroke="#D3D1C7" stroke-width="0.5" data-page-node-id="dEA4IsSa92AJ6aVcrpHA0r"/>
+      <text x="60" y="138" dominant-baseline="central" font-size="12" fill="#444441" data-page-node-id="o8cEUcnmYAerLfbihGHqoe">sessions</text>
+      <text x="60" y="160" dominant-baseline="central" font-size="12" fill="#444441" data-page-node-id="7V9JRgqZov2vjINEzQ6cov">jobs / resume</text>
+      <text x="60" y="182" dominant-baseline="central" font-size="12" fill="#444441" data-page-node-id="uYWPkyYRh2FrM6RzzFEzcb">match_results</text>
+      <text x="60" y="204" dominant-baseline="central" font-size="12" fill="#444441" data-page-node-id="KVDy3u1zoVOmr6Lvlc5LgP">progress_logs</text>
+      <text x="60" y="228" dominant-baseline="central" font-size="12" fill="#888780" data-page-node-id="q5JzIEHuEacS6E0Bbh4gHz">无 user_id · 仅 session 标识</text>
+      <line x1="314" y1="150" x2="366" y2="150" stroke="#0F6E56" stroke-width="1.5" marker-end="url(#g3a)" data-page-node-id="6bj7GKwIufiGaEMqofjEI4"/>
+      <text x="340" y="131" text-anchor="middle" dominant-baseline="central" font-size="11" fill="#5F5E5A" data-page-node-id="YTaQ2yHRRrbDdqHlnzdhVn">结果落库</text>
+      <rect x="370" y="50" width="270" height="200" rx="12" fill="#E1F5EE" stroke="#0F6E56" stroke-width="0.5" data-page-node-id="gfLpgNpJGQgDhQIvgcZaEv"/>
+      <text x="390" y="78" dominant-baseline="central" font-size="14" font-weight="500" fill="#04342C" data-page-node-id="1UyRFin4iHi8BJBvOYXFb1">careerly.db</text>
+      <text x="390" y="100" dominant-baseline="central" font-size="12" fill="#0F6E56" data-page-node-id="vsk72jZzmagZurnftJFQA2">业务真相 · 不可丢弃</text>
+      <line x1="390" y1="116" x2="620" y2="116" stroke="#9FE1CB" stroke-width="0.5" data-page-node-id="pnjzygpEvWDu2flDXlYYqO"/>
+      <text x="390" y="138" dominant-baseline="central" font-size="12" fill="#085041" data-page-node-id="wvuTuqEyx22q7zs0plr0wz">analysis_projects</text>
+      <text x="390" y="160" dominant-baseline="central" font-size="12" fill="#085041" data-page-node-id="Ff2sgVC9453YSE0ZJX0aM4">jobs / project_jobs</text>
+      <text x="390" y="182" dominant-baseline="central" font-size="12" fill="#085041" data-page-node-id="EfHqZIzpCPae0oI30yurDF">analysis_results / job_matches</text>
+      <text x="390" y="204" dominant-baseline="central" font-size="12" fill="#085041" data-page-node-id="ZzXjBnYuDMZU3VeQt7QJR6">careerly_resumes / user_quota</text>
+      <text x="390" y="228" dominant-baseline="central" font-size="12" fill="#0F6E56" data-page-node-id="TO52VmMiLWGyINFeEEkIDa">全表 user_id 隔离 · 需备份</text>
+    </svg>
+  </div>
+  <p class="note" data-page-node-id="tMuqVwx1HTzeFLGN9lve6C">
+    <b data-page-node-id="Dfpu3ws05J0T2cWdzYVixB">G2 的根因就在这张图里</b>：<span class="mono" data-page-node-id="GY2nFOOCd0jG1GEK03ctff">graph_state.db</span> 没有 <span class="mono" data-page-node-id="sxQlyiY85VjyQByx3uwNsO">user_id</span>，
+    引擎不知道「谁」在分析。于是只要拿到 <span class="mono" data-page-node-id="WotavET9imgxG8zOgb9FjB">session_id</span>，就能读到他人的匹配结果与简历片段。
+  </p>
+</section>
+
+<section data-page-node-id="rZiLyeXV5WwHm3QputfYgM">
+  <h2 data-page-node-id="YRPsN5g9GnfMslU9pxDY08"><span class="num" data-page-node-id="SVF6kX1B4PxXbDa9PVOnHq">4</span>实施路线：P0 做完才有意义</h2>
+  <p class="sub" data-page-node-id="mYJx8BPRFabEbjDAU5KsMr">P0 是唯一「不做就无法验证任何东西」的阶段，必须最先执行。</p>
+  <div class="fig" data-page-node-id="5OH6A035vKO88tszfkGJhv">
+    <svg viewBox="0 0 680 380" width="100%" role="img" style="font-family:inherit" xmlns="http://www.w3.org/2000/svg" data-page-node-id="3pGy2rHNKAPAd3UXmrBQet">
+      <title>分阶段实施路线</title>
+      <desc data-page-node-id="uLSB9mNZPnsmcWwEYO0TwU">六个阶段：P0 端到端连通、P1 任务可观测、P2 成长时间轴为关键路径；P3 聚合端点、P4 整洁度、P5 生产就绪为后续。</desc>
+      <rect x="40" y="60" width="52" height="40" rx="6" fill="#FAC775" stroke="#854F0B" stroke-width="1.5" data-page-node-id="gaFVdVD9xxbJvZkCejLXxF"/>
+      <text x="66" y="80" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#412402" data-page-node-id="je2bTNjpNUj6mF7yHVIwbv">P0</text>
+      <rect x="100" y="60" width="540" height="40" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5" data-page-node-id="iD68JU1XzQSAmCstPcONQB"/>
+      <text x="116" y="80" dominant-baseline="central" font-size="12" fill="#412402" data-page-node-id="kP06ReKdcvsO3ECotDHFoe">端到端连通 · Android 权限 + 越权修复 + 冒烟脚本</text>
+      <rect x="40" y="112" width="52" height="40" rx="6" fill="#FAC775" stroke="#854F0B" stroke-width="0.5" data-page-node-id="XmIP6k1vFRMvJyL7ywWSLR"/>
+      <text x="66" y="132" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#412402" data-page-node-id="zmwCZM294PGrL2efxoffwL">P1</text>
+      <rect x="100" y="112" width="540" height="40" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5" data-page-node-id="rC8nNC4nvP0aPtsXWxH9hg"/>
+      <text x="116" y="132" dominant-baseline="central" font-size="12" fill="#412402" data-page-node-id="8E31jr9TqYxrJ2ipbujSC1">任务可观测 · analysis_tasks 状态机 + 契约回写 + 回归测试</text>
+      <rect x="40" y="164" width="52" height="40" rx="6" fill="#FAC775" stroke="#854F0B" stroke-width="0.5" data-page-node-id="goTlWKJwGGcRdbyxJVov9x"/>
+      <text x="66" y="184" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#412402" data-page-node-id="lslnh8jutJGH35Rk0q1lQS">P2</text>
+      <rect x="100" y="164" width="540" height="40" rx="8" fill="#FAEEDA" stroke="#BA7517" stroke-width="0.5" data-page-node-id="7wR8dRh2dMGGOHjmUPLSWA"/>
+      <text x="116" y="184" dominant-baseline="central" font-size="12" fill="#412402" data-page-node-id="Yo2bBIIbZWyOpAJvjA0qpv">成长时间轴 · capability_snapshots + growth_events + diff 算法</text>
+      <rect x="40" y="216" width="52" height="40" rx="6" fill="#D3D1C7" stroke="#5F5E5A" stroke-width="0.5" data-page-node-id="cXxzrZppt9LwNVBc6qkdRJ"/>
+      <text x="66" y="236" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#2C2C2A" data-page-node-id="6kjUVfrBtmWL5dFwvbHITY">P3</text>
+      <rect x="100" y="216" width="540" height="40" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5" data-page-node-id="HpOeCfasQDL1ydAjPSGGAG"/>
+      <text x="116" y="236" dominant-baseline="central" font-size="12" fill="#444441" data-page-node-id="Wa1HtQdmUfau5POsfuV3Vm">聚合端点 · career/assets + home/summary + profile + ai</text>
+      <rect x="40" y="268" width="52" height="40" rx="6" fill="#D3D1C7" stroke="#5F5E5A" stroke-width="0.5" data-page-node-id="2f2bwGEBj3J1Hx3n49RyH3"/>
+      <text x="66" y="288" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#2C2C2A" data-page-node-id="53tLJcejBtsewhn3cs5C31">P4</text>
+      <rect x="100" y="268" width="540" height="40" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5" data-page-node-id="CA1KpCss5fVb3aAzOnQks8"/>
+      <text x="116" y="288" dominant-baseline="central" font-size="12" fill="#444441" data-page-node-id="i5M7qcb3zLMGgZDjAn3fzU">整洁度 · router 归位 + Playwright 池接线 + TTL 清理</text>
+      <rect x="40" y="320" width="52" height="40" rx="6" fill="#D3D1C7" stroke="#5F5E5A" stroke-width="0.5" data-page-node-id="p3QuaiqYrUnjDIDPDiYasY"/>
+      <text x="66" y="340" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#2C2C2A" data-page-node-id="2Yp73m0hJ4cP8UdqdApBCJ">P5</text>
+      <rect x="100" y="320" width="540" height="40" rx="8" fill="#F1EFE8" stroke="#B4B2A9" stroke-width="0.5" data-page-node-id="q5OMqxZNtYD87h0je6u3kA"/>
+      <text x="116" y="340" dominant-baseline="central" font-size="12" fill="#444441" data-page-node-id="ITHO7kuoPdjAyCHBaW7Hrx">生产就绪 · 备份 + 监控 + JWT secret + 部署</text>
+    </svg>
+  </div>
+  <p class="note" data-page-node-id="VMQneuegnba76jaS2HH8wH">
+    P0–P2 是关键路径（琥珀色）：<b data-page-node-id="oT96HtSQguRlrGv74LccnK">先能连通，再能观测，然后才有成长</b>。P3–P5 属于锦上添花，不能抢占 P0。
+  </p>
+</section>
+
+<section data-page-node-id="ze5xgya3fz1kLsW3HCU8qk">
+  <h2 data-page-node-id="HmbdXCHib0fFFOCwJC0fof"><span class="num" data-page-node-id="56hDC7jJdWedc26CGzPR9G">5</span>数字速览</h2>
+  <div class="takeaways" data-page-node-id="4hLTJ8spUpQqe28kns4krO">
+    <div class="card is-ok" data-page-node-id="qmrnrRnZkGToJ90mZinLdg">
+      <div class="k" data-page-node-id="8cG8fpYlxMxnCfCzCTCkLV">模块复用</div>
+      <div class="v" data-page-node-id="F9B21I4eUx90QJWA1BEyq6">18 / 26</div>
+      <div class="d" data-page-node-id="AkQqEzDIXgWIvg7IaR54lx">原样复用，0 重写、0 删除。已有投资几乎全保住</div>
+    </div>
+    <div class="card is-danger" data-page-node-id="MHjdQiriQjIsmYRZ69y0ji">
+      <div class="k" data-page-node-id="6ZduCHuu7CxxCmGLApbEr5">阻断级缺口</div>
+      <div class="v" data-page-node-id="OcGQG1GJrpG7UwAJsjq4ra">3 项</div>
+      <div class="d" data-page-node-id="qJKTA9UY9k4K4DLm5ruh9a">网络权限 · 越权访问 · 成长表缺失</div>
+    </div>
+    <div class="card" data-page-node-id="5JsqdMSFBSnoKGRMORGeAy">
+      <div class="k" data-page-node-id="ax0QHmtMC3xVeiXcHEccRc">前端已接后端</div>
+      <div class="v" data-page-node-id="BEdiNsSA2ScK44ALoIOADO">3 / 8</div>
+      <div class="d" data-page-node-id="MfCUxZKp3dqclu16h9suKK">auth / analysis / resume 已通；其余 5 个仍走 Mock</div>
+    </div>
+    <div class="card" data-page-node-id="46K9JI5JwWRmef8XjWSEge">
+      <div class="k" data-page-node-id="HXrSWEtEYWUHS7DHY3kNl7">分析耗时余量</div>
+      <div class="v" data-page-node-id="quYZVpRJXwUCrHMcHFvcDM">90s</div>
+      <div class="d" data-page-node-id="EiUU6gUQF1NyajXlA1kvqG">210s 实测 vs 300s 超时，仅 30% 缓冲</div>
+    </div>
+  </div>
+</section>
+
+<section data-page-node-id="62FWvXvYHEWFHP8XWzRcGW">
+  <h2 data-page-node-id="itZ0f5gf7c5EKzT1pwQ2QG"><span class="num" data-page-node-id="BH09PcTcdMdXxTd77tLV51">6</span>三条不可破的边界</h2>
+  <ul class="rules" data-page-node-id="XOsFk7DwvkqBiMgMcQAikH">
+    <li data-page-node-id="D6zoYETtsekOV5D76Ur7dz"><b data-page-node-id="tCRbHajq7iApMbpVQr1q0w">Flutter 只认识 Careerly API。</b>永不直接调 <span class="mono" data-page-node-id="Tq6Ffu9AsIGButVtyzMo6z">/api/v1/match</span>。LangGraph、Qwen、Playwright、爬虫对 App 完全不可见。</li>
+    <li data-page-node-id="y1jIuEaMFxBVg8PBh2OO7D"><b data-page-node-id="wrl56gEs2STazrDJM6S8fF">L2 → L1 是进程内方法调用，不是 HTTP。</b>绝不为引擎单独起一个 FastAPI 服务 —— 同一进程内再走一次 HTTP 往返，只增加延迟与故障面。</li>
+    <li data-page-node-id="NhKZ7gHp9Hpp1e32N0P1Uu"><b data-page-node-id="73j6D1BY7BD8hE7LJNCBtX">Careerly 领域模型 ≠ 引擎领域模型。</b>两者只能通过显式映射函数互转。禁止把 <span class="mono" data-page-node-id="qrN73tI8PaFdGEjNom1fJE">MatchResult</span> 直接变成 API 响应，也禁止让 <span class="mono" data-page-node-id="bJ0am6JAtndXHFlLDDOlMq">JobPosting</span> 落进 <span class="mono" data-page-node-id="L7gVhsv2mkeCRpxE76lgEC">careerly.db</span>。</li>
+  </ul>
+</section>
+
+<section data-page-node-id="nBA0liegvOYtSSUBf47BEA">
+  <h2 data-page-node-id="O3bPqdOvEButBACXee6zYD"><span class="num" data-page-node-id="lkmtvi0m5aoghJmOM3ylNn">7</span>待裁决（阻塞下一步）</h2>
+  <table data-page-node-id="d9z7ghSytOKhNXYAqIboLc">
+    <thead data-page-node-id="qM4p86wKMMACE7KXGR2mnS">
+      <tr data-page-node-id="LHEqH0ng9A6L3wTVki7ECn"><th style="width:34%" data-page-node-id="j86Y6iewJBTz9toWTbs5Ou">事项</th><th style="width:36%" data-page-node-id="fLopd3CDad20euf9UyNJ1e">影响</th><th data-page-node-id="sm5XTlnVMRCgnzv1jnNN2q">建议</th></tr>
+    </thead>
+    <tbody data-page-node-id="kmMzrJeDeaecJY8mug3TkI">
+      <tr data-page-node-id="4iM3JNl7gto2V0JogLz9lt">
+        <td data-page-node-id="DdREXWtuYgSALF1AB2sXwa">分析调用形态</td>
+        <td data-page-node-id="1KmitUzlBWLYQJaQsylIaE">P1 工作量与移动端可靠性</td>
+        <td data-page-node-id="ieVTUzs71VbKQH3GROgJI6"><span class="tag o" data-page-node-id="sL2Moz3BTXfm4mc5tIQUZy">双模兼容</span> 默认同步不变，弱网可退异步</td>
+      </tr>
+      <tr data-page-node-id="ivZJZ78PGPoSpK7jYU2WXL">
+        <td data-page-node-id="84EjTHKtrBvC78fu8Csue5">Flutter 不存 token 是否维持</td>
+        <td data-page-node-id="E6EuwztMpyOjlcc42aD79G">用户隔离与配额是否有主体</td>
+        <td data-page-node-id="NnMhYRxL2GiKfVZ6IebECN"><span class="tag w" data-page-node-id="4zuNErwxUc8XxlJr8sG4Ef">建议复核</span> 冷启动即新用户，成长时间轴会失去归属</td>
+      </tr>
+      <tr data-page-node-id="1QY2b7tQXVHCrNDL46k5Dv">
+        <td data-page-node-id="oYZo3DXDz8DtyasxL4HtDO">契约路径回写方向</td>
+        <td data-page-node-id="SWN8aomVGNDQ4hyHReJqTC">文档与实现的单轨化</td>
+        <td data-page-node-id="t1PLlxETQE8H8Xwwqb2uiN"><span class="tag" data-page-node-id="z2q2onr237vrGJ6kxNJaxw">按实现回写</span> 前后端代码已一致，改代码会连带改 App</td>
+      </tr>
+      <tr data-page-node-id="BMmJPBt4OP8EyXPDD6ow0c">
+        <td data-page-node-id="toOXbPdSo32fG7YpbzoNUj">P0 是否立即执行</td>
+        <td data-page-node-id="8nBLA3t5PEpvAtfhUpCQ6B">能否验证任何后端改动</td>
+        <td data-page-node-id="70LfNZwq9xZ4lprqFJ6i2f"><span class="tag d" data-page-node-id="D2Ezv7DURMQhdeAJb2TubJ">建议立即</span> 当前无法证明前后端能通</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+
+<footer data-page-node-id="Ir412im38NGBNbUVhfWWqT">
+  依据文档：<span class="mono" data-page-node-id="FpnszXGOQNrn4O5THMkGsC">work_agent/docs/careerly/INTEGRATION_ARCHITECTURE.md</span>（完整审计）
+  ·
+  <span class="mono" data-page-node-id="hwzoZP2g4aezl0RQE1lWhc">work_agent/docs/careerly/BACKEND_API_CONTRACT.md</span>（API 契约）
+  <br data-page-node-id="bGZfsgI2HFKUACGlhl00p9">
+  本指南为只读审计产出，未修改任何业务代码。
+</footer>
+
+</div>
+</body>
+</html>

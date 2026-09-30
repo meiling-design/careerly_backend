@@ -21,11 +21,19 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.api.middleware import add_api_middleware
+from app.core.auth_mode import assert_auth_configuration_is_safe, auth_mode_banner
 from app.core.errors import AppError
 from app.core.orchestrator import DecisionGraph
 from app.core.security import get_current_user
 from app.core.state_store import StateStore
 from app.utils.logger import logger
+
+# ── 认证边界自检（决策 D-NEW 方案 A / P0-6）──────────────────────────────────
+# 必须在创建 app 之前执行：ENV=production + AUTH_MODE=dev → **拒绝启动**。
+# 这里刻意用 fail-fast 而不是告警 —— 「先这样跑着，等产品快上线再补」正是
+# 告警拦不住、而这行 raise 能拦住的那类决定。
+assert_auth_configuration_is_safe()
+logger.info("Auth boundary | %s", auth_mode_banner())
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 

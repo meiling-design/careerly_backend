@@ -133,7 +133,21 @@ async def login(req: LoginRequest) -> JSONResponse:
     ⚠️ 未决项 C1b：PRD / IA 均未定义「手机号未注册」的产品规则
     （``AuthRepository.login`` 的 Mock 刻意不判断账号是否存在）。
     此处取最小实现：未注册即 401 PHONE_NOT_REGISTERED，等待产品侧裁决。
+
+    ⚠️ 认证边界（决策 D-NEW 方案 A / P0-6）：本端点是 **DEV 认证** ——
+    只凭手机号即签发 token，**无任何凭证校验**，等价于「知道手机号即可接管账号」。
+    因此当 ``AUTH_MODE != dev`` 时直接拒绝（501），而不是继续签发 token：
+    正式身份验证通道见 Roadmap P5-4。
     """
+    from app.core.auth_mode import is_dev_auth
+
+    if not is_dev_auth():
+        return _err(
+            "AUTH_MODE_UNAVAILABLE",
+            "当前部署未启用开发直登；正式身份验证通道尚未上线",
+            501,
+        )
+
     store = AuthStore()
     user = store.get_by_phone(req.phone.strip())
 

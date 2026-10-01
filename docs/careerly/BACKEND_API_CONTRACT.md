@@ -10,14 +10,96 @@
 
 ## 0. 结论速览
 
+> 📌 **本节已于 P1-4（2026-10-01）按实现回写。** 五处冲突已全部裁决，状态列为**当前实况**而非草案。
+>
+> 各冲突的裁决依据与时间见 `DEVELOPMENT_PRIORITY.md` §五 决策记录。
+
 | # | 事项 | 状态 |
 |---|---|---|
-| — | Flutter 契约 → 后端端点映射 | ✅ 已完整推导（§1–§3） |
-| C1 | **认证身份字段**：手机号（D85）vs 邮箱+密码（后端 JWT） | 🔴 **产品级冲突，阻塞** |
-| C2 | 分析调用形态：同步返回 Project vs 异步 task_id | 🟠 语义冲突，需定接口形态 |
-| C3 | 额度 QuotaState（免费 3 次）vs 后端 DemoGuard | 🟠 规则不同，需后端实现配额 |
-| C4 | 能力分值模型缺失：Flutter 需 0–100 能力分 + delta，后端无 | 🔴 能力模型缺口，阻塞成长模块 |
-| C5 | 会话持久化（D52 不存 / D54 待裁决）→ user_id 隔离在 App 侧无处落地 | 🔴 阻塞「user_id 隔离」改造项 |
+| — | Flutter 契约 → 后端端点映射 | ✅ 已推导；实际对接范围见 **§0.5.1** |
+| C1 | **认证身份字段**：手机号（D85）vs 邮箱+密码 | ✅ **已裁决**：手机号直登，`DEV 可用 / PROD 硬阻断`（D-NEW 方案 A）。`app/core/auth_mode.py` 导入期 fail-fast |
+| C2 | 分析调用形态：同步 vs 异步 | ✅ **已裁决 D-A ②**：对外同步（Flutter 零改动），内部保留任务状态机便于升级异步 |
+| C3 | 额度规则 | ✅ **已落地**：`careerly.db: user_quota`（免费 3 次），仅分析**成功**后扣减，失败不扣 |
+| C4 | 能力分值模型缺失 | ✅ **已落地**：`LLMService.score_capabilities()` + `capability.normalize()` 严格校验 + 完整降级。🔧 **P1-5 修复了一处取值 bug**（见 §0.5.5） |
+| C5 | 会话持久化 → user_id 隔离无处落地 | ✅ **已落地**：**D-B 推翻 D52** —— token 安全持久化（Android Keystore / iOS Keychain），refresh 90 天。冷启动不再丢失身份主体 |
+
+---
+
+## 0.5 落地状态：已落地子集 vs 目标态（P1-4 回写）
+
+> ⚠️ **这一节是唯一可信的实现清单。** 端点表由 `app.openapi()` 实际导出，
+> Flutter 调用清单由 `grep '/api/v1/' lib/**/*.dart` 实际导出，避免文档与代码漂移。
+>
+> 下方 §1–§4 保留为**设计推导**，其中的路径若与本节冲突，**以本节为准**。
+
+### 0.5.1 已落地且已对接（Flutter → 真实后端）
+
+以下 5 个端点构成当前 MVP 的完整闭环：**登录 → 存简历 → 分析 → 读结果 → 查额度**。
+
+| Flutter 侧 | 方法与路径 | 鉴权 | 备注 |
+|---|---|---|---|
+| `AuthRepository.register` | `POST /api/v1/auth/register` | — | `AUTH_MODE=dev` 下手机号直登，无需验证码 |
+| `AuthRepository.login` | `POST /api/v1/auth/login` | — | 同上 |
+| `ResumeRepository.submitResumeText` | `PUT /api/v1/resume` | JWT | 存简历基线 |
+| `ResumeRepository.fetchProfile` | `GET /api/v1/resume` | JWT | 无基线时返回 `null` |
+| `AnalysisRepository.analyze` | `POST /api/v1/analysis` | JWT | **同步**跑完 LangGraph 8 节点后返回（10–210s） |
+| `AnalysisRepository.fetchProjects` | `GET /api/v1/analysis/projects` | JWT | |
+| `AnalysisRepository.fetchProject` | `GET /api/v1/analysis/projects/{id}` | JWT | 越权 → 404 |
+| `AnalysisRepository.fetchJobLibrary` | `GET /api/v1/analysis/jobs` | JWT | |
+| `AnalysisRepository.fetchQuota` | `GET /api/v1/quota` | JWT | ⚠️ 路径与 §1 草案不同，见 §0.5.4 |
+
+> 另有 `POST /api/v1/auth/refresh`（刷新令牌）与 `GET /api/v1/auth/me`，由 `ApiClient`
+> 在 401 时自动调用，Flutter Repository 层不直接感知。
+
+### 0.5.2 已存在但 Flutter 未对接（仍走 Mock）
+
+| 方法与路径 | 状态 | 卡在哪 |
+|---|---|---|
+| `GET /api/v1/analysis/tasks` | ✅ 已建（P1-1a） | Flutter 未接；等 P1-1b 定「要不要轮询」 |
+| `GET /api/v1/analysis/tasks/{id}` | ✅ 已建（P1-1a） | 同上 |
+| `POST /api/v1/resume/upload` | ✅ 已建（multipart） | **Flutter 明确不接**：单版本基线用文本即可，文件上传排 P3 |
+
+### 0.5.3 目标态（契约里有、后端未建）
+
+| §1 契约要求 | 计划 | 阻塞什么 |
+|---|---|---|
+| `GET/POST /api/v1/resume/versions`、`versions/{id}/current` | **P3** | 简历多版本对比 |
+| `GET /api/v1/growth/events`、`/growth/timeline` | **P2（产品核心）** | 「看见自己的变化」闭环，缺 `growth_events` 表 |
+| `GET /api/v1/career/assets` | **P3** | 「我的」职业资产 |
+| `GET /api/v1/home/summary` | **P3** | 首页真实数据 |
+| `GET /api/v1/profile` | **P3** | 「我的」身份资料 |
+| `POST /api/v1/ai/messages` | **P3** | AI 对话 |
+
+### 0.5.4 ⚠️ 路径分歧（契约草案 ≠ 实际实现）
+
+**这些都是 Flutter 已按「实际实现」写好的**，回头要把 §1 的草案改过来，而不是改代码 ——
+否则会为了对齐文档把已经跑通的链路弄断。
+
+| §1 草案写的 | 实际实现的 | 谁迁就谁 |
+|---|---|---|
+| `GET /api/v1/analysis/quota` | `GET /api/v1/quota` | 改文档 |
+| `GET /api/v1/resume/profile` | `GET /api/v1/resume` | 改文档 |
+| `POST /api/v1/resume/text` | `PUT /api/v1/resume` | 改文档 |
+| `POST /api/v1/resume/baseline` | `GET /api/v1/resume`（无独立解析端点） | 改文档 |
+| `POST /api/v1/resume/file`（multipart） | `POST /api/v1/resume/upload` | 改文档 |
+
+### 0.5.5 P1-5 发现并修复的阻断性 Bug（值得记一笔）
+
+`run_analysis()` 取简历画像时写成 `state.resume`，而 `GraphState` 的字段名是
+`resume_output` → `AttributeError`。这行**不在** try 块内，异常一路冒到 router 兜底分支，
+把一次**已经成功**的分析（节点全跑完、报告已导出）变成 `502 ANALYSIS_FAILED`。
+
+它潜伏了整整一个版本没被发现，正因为此前**没有任何测试真的跑引擎** —— 既有测试把
+`run_analysis` 整个 monkeypatch 掉了。P1-5 把替换点下移到模型供应商层后第一行就暴露。
+回归套件见 `tests/test_p1_engine_e2e.py`。
+
+### 0.5.6 历史别名（勿再新增调用）
+
+根路径 `/health`、`/match`、`/sessions*`、`/sessions/{id}/report` 是 `/api/v1/*`
+的历史别名，**P1-3 已标记 `deprecated`**，错误格式也已与 `/api/v1/*` 统一（此前裸抛
+`HTTPException` 返回 `{"detail": ...}`）。保留是为了兼容 README 中的旧脚本（决策 D-H），
+但**两侧输入契约不同**（v1 侧强制 `job_urls` 非空且有 X-Client-Key / demo 配额 / 输入长度
+三重守门），故未合并实现，真正合并列 P4。
 
 ---
 

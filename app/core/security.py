@@ -13,7 +13,9 @@ Configuration (environment variables)
                                   in production; an insecure dev default is
                                   used otherwise (with a warning).
 * ``ACCESS_TOKEN_EXPIRE_MINUTES`` Lifetime of access tokens (default 60).
-* ``REFRESH_TOKEN_EXPIRE_DAYS``   Lifetime of refresh tokens (default 7).
+* ``REFRESH_TOKEN_EXPIRE_DAYS``   Lifetime of refresh tokens (default **90**;
+                                  was 7 — raised in P1-6, see the comment on
+                                  the constant for the reasoning).
 """
 
 from __future__ import annotations
@@ -40,7 +42,32 @@ if SECRET_KEY == "dev-insecure-change-me":
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+
+# ── P1-6 / 裁决 D-B：refresh 有效期 7 天 → 90 天 ───────────────────────────
+#
+# 安全持久化解决的是「**同一会话内**重启 App 不失忆」；
+# 过期策略解决的是「**跨周/跨月**回来还记得我是谁」。两者缺一不可 ——
+# 只做持久化、不动有效期，用户超过一周没打开照样要重新登录。
+#
+# Careerly 是**低频**产品：用户可能几周甚至一两个月才回来一次看「成长变化」。
+# 一旦正式认证（短信验证码，P5）上线，每次重登都意味着收一次短信 ——
+# 7 天会把「回来看一眼」变成一件有摩擦的事。
+#
+# 90 天的取舍：
+#   - access 仍只有 60 分钟，泄露窗口没有变大；
+#   - refresh 每次使用都会**轮换**（/auth/refresh 签发新对），
+#     因此实际暴露的是「连续 90 天不活跃」才失效，而非静态凭据长存 90 天；
+#   - 用户主动登出 / refresh 失效 → Flutter 侧清 Keystore，凭据即消失。
+#
+# ⚠️ 仍缺的一环（P5）：refresh 没有服务端吊销表，改密 / 封号无法即时生效。
+#    当前可接受（无密码、无短信，谈不上「改密」），接正式认证时必须补。
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "90"))
+
+if REFRESH_TOKEN_EXPIRE_DAYS > 365:
+    logger.warning(
+        "REFRESH_TOKEN_EXPIRE_DAYS=%d 超过 365 天 —— 长期凭据风险，确认这是有意为之。",
+        REFRESH_TOKEN_EXPIRE_DAYS,
+    )
 
 # Token-type claim used to discriminate access vs refresh tokens.
 _ACCESS_TYPE = "access"

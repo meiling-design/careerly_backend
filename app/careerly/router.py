@@ -13,6 +13,8 @@ Endpoints (all require a JWT via ``get_current_user``):
     PUT  /api/v1/resume                      save resume baseline text (P3 preview)
     GET  /api/v1/resume                      read resume baseline
     GET  /api/v1/quota                       QuotaState (Baseline §5: free 3)
+    GET  /api/v1/growth/events               growth footprint events (P2-4)
+    GET  /api/v1/growth/timeline             events within an occurredAt range (P2-4)
 
 Analysis is synchronous (decision C2): the engine call is offloaded to a
 thread executor so the event loop stays responsive during the 10–20s run.
@@ -23,10 +25,11 @@ from __future__ import annotations
 import asyncio
 from functools import partial
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from app.api.envelope import err, ok
 from app.core.security import get_current_user
+from app.careerly import growth
 from app.careerly.engine import AnalysisError, run_analysis
 from app.careerly.schemas import AnalyzeRequest, dump
 from app.careerly.store import CareerlyStore
@@ -110,6 +113,7 @@ async def analyze(
         return err("ANALYSIS_FAILED", f"分析失败：{exc}", 502)
 
     store.save_project(user_id, project)
+    growth.record_analysis_growth(store, user_id, project)  # P2：快照 + 成长事件
     store.consume_quota(user_id)
     store.complete_task(task_id, project.id)
     logger.info("Careerly analyze | user=%d | project=%s | task=%s | quota=%d/%d",
@@ -214,3 +218,59 @@ async def get_resume(current_user: dict = Depends(get_current_user)):
 @router.get("/quota")
 async def get_quota(current_user: dict = Depends(get_current_user)):
     return ok(dump(get_store().get_quota(int(current_user["id"]))))
+
+
+# ── Growth（P2-4：成长足迹只读面）──────────────────────────────────────────
+#
+# 事件由「相邻快照 diff」在分析成功时派生（growth.py），这里只做
+# 按 user 作用域的查询。type 必须是 Dart enum 名 —— 非法值 422，
+# 绝不静默忽略（静默会让前端以为「没有这类事件」）。
+
+
+@router.get("/growth/events")
+async def list_growth_events(
+    type: str | None = None,
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user),
+):
+    store = get_store()
+    if type is not None and type not in growth.VALID_TYPES:
+        return err(
+            "INVALID_TYPE",
+            f"未知成长事件类型：{type}（可选：{'/'.join(sorted(growth.VALID_TYPES))}）",
+            422,
+        )
+    return ok(store.list_growth_events(int(current_user["id"]), type=type, limit=limit))
+
+
+@router.get("/growth/timeline")
+async def growth_timeline(
+    from_: str | None = Query(None, alias="from"),
+    to: str | None = None,
+    limit: int = 200,
+    current_user: dict = Depends(get_current_user),
+):
+    store = get_store()
+    from_ts = _parse_iso(from_)
+    to_ts = _parse_iso(to)
+    if from_ is not None and from_ts is None:
+        return err("INVALID_RANGE", f"from 不是合法 ISO-8601 时间：{from_}", 422)
+    if to is not None and to_ts is None:
+        return err("INVALID_RANGE", f"to 不是合法 ISO-8601 时间：{to}", 422)
+    if from_ts is not None and to_ts is not None and from_ts > to_ts:
+        return err("INVALID_RANGE", "from 不能晚于 to", 422)
+    return ok(store.list_growth_events_range(
+        int(current_user["id"]), from_ts=from_ts, to_ts=to_ts, limit=limit,
+    ))
+
+
+def _parse_iso(value: str | None) -> float | None:
+    """ISO-8601 string → unix seconds; None/unparseable → None."""
+    if not value:
+        return None
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None

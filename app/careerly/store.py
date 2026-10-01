@@ -157,11 +157,38 @@ class CareerlyStore:
                 finished_at   REAL
             );
 
+            -- P2-1：能力快照 —— 成长的参照系。每次分析成功写一条，
+            -- 「我现在是什么样」只追加、不修改（与分析版本化同一哲学）。
+            -- scores JSON 结构：{"capabilities": {name: score}, "matchScore": int|null}
+            CREATE TABLE IF NOT EXISTS capability_snapshots (
+                id         TEXT PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                source     TEXT NOT NULL DEFAULT 'analysis',
+                source_id  TEXT,                -- source=analysis 时为 project_id
+                scores     TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL
+            );
+
+            -- P2-2：成长事件 —— 由相邻两条快照 diff 派生（growth.py），
+            -- 不存冗余状态字段；type 必须是 Dart enum 名
+            -- （experience|skill|capability|matchScore|rank），前端 tryParse 直读。
+            CREATE TABLE IF NOT EXISTS growth_events (
+                id          TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL,
+                type        TEXT NOT NULL,
+                title       TEXT NOT NULL DEFAULT '',
+                description TEXT,
+                delta       INTEGER,
+                occurred_at REAL NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_projects_user ON analysis_projects(user_id);
             CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id);
             CREATE INDEX IF NOT EXISTS idx_results_project ON analysis_results(project_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_user ON analysis_tasks(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON analysis_tasks(status);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_user ON capability_snapshots(user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_growth_user ON growth_events(user_id, occurred_at);
         """)
         conn.commit()
 
@@ -437,6 +464,107 @@ class CareerlyStore:
             "startedAt": iso(started) if started else None,
             "finishedAt": iso(finished) if finished else None,
             "durationMs": duration_ms,
+        }
+
+    # ── Capability snapshots & growth events (P2) ───────────────────────
+    #
+    # 快照是「写一次、永不改」的参照系；事件是 diff 的**产物**。
+    # 派生逻辑在 app/careerly/growth.py —— store 只负责持久化与按 user 作用域读。
+
+    def save_snapshot(self, user_id: int, source: str, source_id: Optional[str],
+                      scores: dict[str, Any]) -> str:
+        """Append one immutable snapshot; returns its id."""
+        snapshot_id = f"snap_{uuid.uuid4().hex[:16]}"
+        conn = _get_conn(self.db_path)
+        conn.execute(
+            "INSERT INTO capability_snapshots (id, user_id, source, source_id, scores, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (snapshot_id, user_id, source, source_id, _j(scores), time.time()),
+        )
+        conn.commit()
+        return snapshot_id
+
+    def get_latest_snapshot(self, user_id: int) -> Optional[dict[str, Any]]:
+        """The user's most recent snapshot (the diff baseline), or None."""
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT * FROM capability_snapshots WHERE user_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "source": row["source"],
+            "sourceId": row["source_id"],
+            "scores": _unjson(row["scores"], {}),
+            "createdAt": iso(row["created_at"]),
+        }
+
+    def save_growth_events(self, user_id: int, events: list[dict[str, Any]]) -> None:
+        """Persist derived events. ``events`` items: type/title/description/delta/occurred_at(float)."""
+        if not events:
+            return
+        conn = _get_conn(self.db_path)
+        for ev in events:
+            conn.execute(
+                "INSERT INTO growth_events (id, user_id, type, title, description, delta, occurred_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (f"gev_{uuid.uuid4().hex[:16]}", user_id, ev["type"], ev["title"],
+                 ev.get("description"), ev.get("delta"), ev["occurred_at"]),
+            )
+        conn.commit()
+
+    def list_growth_events(self, user_id: int, type: Optional[str] = None,
+                           limit: int = 50) -> list[dict[str, Any]]:
+        conn = _get_conn(self.db_path)
+        limit = min(max(limit, 1), 200)
+        if type:
+            rows = conn.execute(
+                "SELECT * FROM growth_events WHERE user_id = ? AND type = ? "
+                "ORDER BY occurred_at DESC LIMIT ?",
+                (user_id, type, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM growth_events WHERE user_id = ? "
+                "ORDER BY occurred_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        return [self._growth_row(r) for r in rows]
+
+    def list_growth_events_range(self, user_id: int, from_ts: Optional[float] = None,
+                                 to_ts: Optional[float] = None,
+                                 limit: int = 200) -> list[dict[str, Any]]:
+        conn = _get_conn(self.db_path)
+        clauses = ["user_id = ?"]
+        params: list[Any] = [user_id]
+        if from_ts is not None:
+            clauses.append("occurred_at >= ?")
+            params.append(from_ts)
+        if to_ts is not None:
+            clauses.append("occurred_at <= ?")
+            params.append(to_ts)
+        params.append(min(max(limit, 1), 500))
+        rows = conn.execute(
+            f"SELECT * FROM growth_events WHERE {' AND '.join(clauses)} "
+            "ORDER BY occurred_at DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [self._growth_row(r) for r in rows]
+
+    @staticmethod
+    def _growth_row(row: sqlite3.Row) -> dict[str, Any]:
+        # camelCase，与契约 §2.8 GrowthEvent JSON 逐字段对齐；
+        # type 原样输出 Dart enum 名，绝不翻中文（前端 tryParse 会解析失败）。
+        return {
+            "id": row["id"],
+            "type": row["type"],
+            "title": row["title"],
+            "description": row["description"],
+            "delta": row["delta"],
+            "occurredAt": iso(row["occurred_at"]),
         }
 
     # ── helpers ─────────────────────────────────────────────────────────

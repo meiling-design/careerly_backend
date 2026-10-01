@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 import time
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from app.api.middleware import add_api_middleware
 from app.core.auth_mode import assert_auth_configuration_is_safe, auth_mode_banner
-from app.core.errors import AppError
+from app.core.errors import AppError, ResourceNotFound
 from app.core.orchestrator import DecisionGraph
 from app.core.security import get_current_user
 from app.core.state_store import StateStore
@@ -217,9 +217,29 @@ class SessionSummary(BaseModel):
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
-@app.get("/health")
+# ════════════════════════════════════════════════════════════════════════════
+# 根路径端点 —— /api/v1/* 的历史别名（P1-3）
+# ════════════════════════════════════════════════════════════════════════════
+#
+# ``/match`` 等根路径自项目早期就存在，README 与 docs.md 的示例仍在引用。
+# 决策 **D-H** 明确「旧 API 不删除，默认修复」，所以这里保留路由，
+# 但把它们**收敛为别名语义**：
+#
+#   1. OpenAPI 标记 ``deprecated=True`` —— 调用方在文档里就能看见
+#   2. 错误一律走领域异常（``AppError``）→ 全局处理器转统一信封，
+#      与 ``/api/v1/*`` **形状一致**（此前裸抛 HTTPException 返回的是
+#      ``{"detail": ...}``，两套入口两套错误格式，客户端要写两套解析）
+#
+# ⚠️ **没有**合并实现：两侧的输入契约不同 —— ``/api/v1/match`` 的
+# ``MatchRequest`` 强制 ``job_urls`` 非空（min_length=1）且过 X-Client-Key /
+# demo 配额 / 输入长度三重守门；根 ``/match`` 允许只传简历、无这些门禁。
+# 贸然让根路径委派过去会让老脚本直接 422。真正合并要等产品侧确认
+# 「引擎调试入口」还要不要保留，故列 P4。
+
+
+@app.get("/health", deprecated=True)
 async def health() -> dict:
-    """Health check endpoint."""
+    """Health check endpoint (legacy alias of ``GET /api/v1/health``)."""
     return {
         "status": "ok",
         "service": "job-matching-ai-agent",
@@ -227,17 +247,21 @@ async def health() -> dict:
     }
 
 
-@app.post("/match", response_model=MatchResponse)
+@app.post("/match", response_model=MatchResponse, deprecated=True)
 async def run_match(req: MatchRequest, current_user: dict = Depends(get_current_user)) -> MatchResponse:
-    """Execute the full job matching pipeline.
+    """Execute the full job matching pipeline (legacy alias of ``POST /api/v1/match``).
 
     Accepts job URLs and resume data, runs the 8-node LangGraph decision
     graph, and returns the match results.
+
+    ⚠️ 引擎调试入口，保留仅为兼容旧脚本。新集成请用 ``/api/v1/match``，
+    后者有 X-Client-Key / demo 配额 / 输入长度三重守门。
     """
     if not req.resume_file_path and not req.resume_text:
-        raise HTTPException(
+        raise AppError(
+            "Provide either resume_file_path or resume_text",
+            code="VALIDATION_ERROR",
             status_code=422,
-            detail="Provide either resume_file_path or resume_text",
         )
 
     graph = get_graph()
@@ -271,9 +295,9 @@ async def run_match(req: MatchRequest, current_user: dict = Depends(get_current_
     )
 
 
-@app.get("/sessions", response_model=list[SessionSummary])
+@app.get("/sessions", response_model=list[SessionSummary], deprecated=True)
 async def list_sessions(limit: int = Query(20, ge=1, le=200), current_user: dict = Depends(get_current_user)) -> list[SessionSummary]:
-    """List recent sessions with basic stats."""
+    """List recent sessions with basic stats (legacy alias of ``GET /api/v1/sessions``)."""
     store = get_store()
     rows = store.list_sessions(limit=limit, user_id=str(current_user["id"]))
     return [
@@ -290,15 +314,16 @@ async def list_sessions(limit: int = Query(20, ge=1, le=200), current_user: dict
     ]
 
 
-@app.get("/sessions/{session_id}")
+@app.get("/sessions/{session_id}", deprecated=True)
 async def get_session(session_id: str, current_user: dict = Depends(get_current_user)) -> JSONResponse:
-    """Get full session details including jobs, resume, and match results."""
+    """Get full session details (legacy alias of ``GET /api/v1/sessions/{id}``)."""
     store = get_store()
     # 归属校验先行（P0-4 / 决策 D-G）：归属不符与「不存在」返回同一个 404。
     info = store.get_session_info(session_id, user_id=str(current_user["id"]))
 
     if not info:
-        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        # raises 404 NOT_FOUND，与其它端点同形（不再裸抛 HTTPException）
+        raise ResourceNotFound(f"Session {session_id} not found")
 
     state = store.load_state(session_id)
 
@@ -329,31 +354,31 @@ async def get_session(session_id: str, current_user: dict = Depends(get_current_
     })
 
 
-@app.get("/sessions/{session_id}/report", response_model=None)
+@app.get("/sessions/{session_id}/report", response_model=None, deprecated=True)
 async def download_report(
     session_id: str,
     fmt: str = Query("json", description="Output format: csv, xlsx, md, json"),
     current_user: dict = Depends(get_current_user),
 ) -> FileResponse | JSONResponse:
-    """Download session report in specified format."""
+    """Download session report (legacy alias of ``GET /api/v1/sessions/{id}/report``)."""
     supported = {"csv", "xlsx", "md", "json"}
     if fmt not in supported:
-        raise HTTPException(
+        raise AppError(
+            f"Unsupported format '{fmt}'. Supported: {', '.join(sorted(supported))}",
+            code="VALIDATION_ERROR",
             status_code=400,
-            detail=f"Unsupported format '{fmt}'. Supported: {', '.join(sorted(supported))}",
         )
 
     # 归属校验（P0-4）：报告文件按 session 命名，先确认该 session 属于调用者。
     if not get_store().get_session_info(session_id, user_id=str(current_user["id"])):
-        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        raise ResourceNotFound(f"Session {session_id} not found")
 
     output_dir = Path(__file__).resolve().parent.parent.parent / "data" / "outputs"
     report_file = output_dir / f"report_{session_id}.{fmt}"
 
     if not report_file.exists():
-        raise HTTPException(
-            status_code=404,
-            detail=f"Report for session {session_id} not found. Run /match first.",
+        raise ResourceNotFound(
+            f"Report for session {session_id} not found. Run /match first."
         )
 
     media_types = {

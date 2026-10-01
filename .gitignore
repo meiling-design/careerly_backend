@@ -42,4 +42,5 @@ data/*.db
 
 # Pytest 用例自建的临时库目录（刻意不删除：沙箱 safe-delete 会拦截 unlink/rmtree）
 tests/.tmp_p1/
+tests/.tmp_engine/
 .pytest_tmp/

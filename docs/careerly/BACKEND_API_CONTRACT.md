@@ -58,13 +58,21 @@
 | `GET /api/v1/analysis/tasks` | ✅ 已建（P1-1a） | Flutter 未接；等 P1-1b 定「要不要轮询」 |
 | `GET /api/v1/analysis/tasks/{id}` | ✅ 已建（P1-1a） | 同上 |
 | `POST /api/v1/resume/upload` | ✅ 已建（multipart） | **Flutter 明确不接**：单版本基线用文本即可，文件上传排 P3 |
+| `GET /api/v1/growth/events?type=&limit=` | ✅ 已建（P2-4） | Flutter 已接（P2-5，`ApiGrowthRepository`） |
+| `GET /api/v1/growth/timeline?from=&to=` | ✅ 已建（P2-4） | 同上 |
+
+> **P2 事件派生口径（2026-10-01 裁决）**：事件由「相邻两条 `capability_snapshots`
+> diff」在分析成功时派生（`app/careerly/growth.py`）。首次分析产生一条
+> `experience`「建立职业基线」；`rank` 事件不生成（一次分析一个岗位，无排名
+> 变化语义）；`experience`/`skill` 其余来源（职业资产）仍 Mock，**不伪造** ——
+> 即 roadmap 标注的 P2-6 产品语义开放项，待职业资产接真源时单独对齐。
+> 非法 `type` 返回 422 `INVALID_TYPE`；非法/倒置时间区间返回 422 `INVALID_RANGE`。
 
 ### 0.5.3 目标态（契约里有、后端未建）
 
 | §1 契约要求 | 计划 | 阻塞什么 |
 |---|---|---|
 | `GET/POST /api/v1/resume/versions`、`versions/{id}/current` | **P3** | 简历多版本对比 |
-| `GET /api/v1/growth/events`、`/growth/timeline` | **P2（产品核心）** | 「看见自己的变化」闭环，缺 `growth_events` 表 |
 | `GET /api/v1/career/assets` | **P3** | 「我的」职业资产 |
 | `GET /api/v1/home/summary` | **P3** | 首页真实数据 |
 | `GET /api/v1/profile` | **P3** | 「我的」身份资料 |

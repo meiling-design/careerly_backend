@@ -265,7 +265,15 @@ def run_analysis(
         detail = "；".join(state.errors) if state.errors else "引擎未返回匹配结果"
         raise AnalysisError("ANALYSIS_EMPTY", f"未能产出匹配结果：{detail}", 422)
 
-    capabilities = _score_capabilities_safe(state.resume, raw_jd) if state.resume else None
+    # C4：能力分值。resume 画像失败不影响分析结果本身（详见
+    # ``_score_capabilities_safe`` 的降级策略）。
+    #
+    # ⚠️ 字段名必须是 ``resume_output`` —— ``GraphState`` 上没有 ``resume``。
+    # 写成 ``state.resume`` 会抛 AttributeError，而这个调用**不在**上面那个
+    # try 块里，于是它会一路冒到 router 的兜底分支，把一次**已经成功**的
+    # 分析变成 502。这个 bug 潜伏到 P1-5 才被发现，正因为没有测试真的跑引擎。
+    resume_profile = getattr(state, "resume_output", None)
+    capabilities = _score_capabilities_safe(resume_profile, raw_jd) if resume_profile else None
     project = build_project(
         title=title, raw_jd=raw_jd, match_results=results, capabilities=capabilities,
     )

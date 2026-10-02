@@ -15,6 +15,9 @@ Endpoints (all require a JWT via ``get_current_user``):
     GET  /api/v1/quota                       QuotaState (Baseline §5: free 3)
     GET  /api/v1/growth/events               growth footprint events (P2-4)
     GET  /api/v1/growth/timeline             events within an occurredAt range (P2-4)
+    GET  /api/v1/career/assets               CareerAssets — 「我的」职业资产 (P3-1)
+    GET  /api/v1/home/summary                HomeSummary — 首页摘要 (P3-2)
+    GET  /api/v1/profile                     UserProfile — 「我的」身份资料 (P3-3)
 
 Analysis is synchronous (decision C2): the engine call is offloaded to a
 thread executor so the event loop stays responsive during the 10–20s run.
@@ -29,7 +32,8 @@ from fastapi import APIRouter, Depends, Query
 
 from app.api.envelope import err, ok
 from app.core.security import get_current_user
-from app.careerly import growth
+from app.careerly import assets as career_assets
+from app.careerly import growth, home, identity
 from app.careerly.engine import AnalysisError, run_analysis
 from app.careerly.schemas import AnalyzeRequest, dump
 from app.careerly.store import CareerlyStore
@@ -97,7 +101,7 @@ async def analyze(
 
     loop = asyncio.get_running_loop()
     try:
-        project = await loop.run_in_executor(
+        project, resume_profile = await loop.run_in_executor(
             None,
             partial(run_analysis, title=req.title, raw_jd=req.rawJd, resume_text=resume_text),
         )
@@ -113,6 +117,12 @@ async def analyze(
         return err("ANALYSIS_FAILED", f"分析失败：{exc}", 502)
 
     store.save_project(user_id, project)
+    # P3-1：把引擎解析出的简历画像落库 —— 这是「我的 → 职业资产」的真实数据源。
+    # 在此之前 careerly_resumes.profile 永远是 {}，职业资产页只能走 Mock。
+    # ⚠️ 只在画像非空时写：分析链路可能降级产出 {}，用空值覆盖已有画像
+    # 会让「我的」在功能上回到 Mock 之前的状态。
+    if resume_profile:
+        store.save_resume(user_id, resume_text, resume_profile)
     growth.record_analysis_growth(store, user_id, project)  # P2：快照 + 成长事件
     store.consume_quota(user_id)
     store.complete_task(task_id, project.id)
@@ -192,13 +202,21 @@ async def save_resume(
     body: dict,
     current_user: dict = Depends(get_current_user),
 ):
-    """Persist the resume baseline text used by every analysis (P3 preview)."""
+    """Persist the resume baseline text used by every analysis (P3 preview).
+
+    ⚠️ **Does not touch ``profile``** (P3-1). The parsed profile is written by
+    ``POST /analysis`` (the only place that actually parses). Saving new text
+    here must not wipe it — otherwise "粘贴简历" would silently reset
+    「我的 → 职业资产」to empty, and re-saving identical text would look like
+    the user lost their assets.
+    """
     text = (body.get("text") or "").strip() if isinstance(body, dict) else ""
     if not text:
         return err("VALIDATION_ERROR", "text 不能为空", 422)
     store = get_store()
     user_id = int(current_user["id"])
-    store.save_resume(user_id, text)
+    existing = store.get_resume(user_id) or {}
+    store.save_resume(user_id, text, existing.get("profile") or {})
     saved = store.get_resume(user_id)
     return ok({"text": text, "profile": saved.get("profile", {}),
                "updatedAt": saved.get("updatedAt")})
@@ -274,3 +292,46 @@ def _parse_iso(value: str | None) -> float | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+# ── Career assets / home / profile（P3：聚合读面）────────────────────────────
+#
+# 三个端点都是**只读聚合**：从已有的事实（简历画像、快照、分析结果、认证行）
+# 组装 Flutter 需要的形状，不引入新的写入面，也不调用 LLM。
+# 每个字段的来源与缺失时的行为，见 app/careerly/{assets,home,identity}.py 的模块注释。
+
+
+@router.get("/career/assets")
+async def get_career_assets(current_user: dict = Depends(get_current_user)):
+    """「我的 → 职业资产」（P3-1）。
+
+    数据源：``POST /analysis`` 落库的简历画像 + 最新的能力快照。
+    ⚠️ 从未分析过 → 返回 ``CareerAssets`` 空态（不是 404）：
+    「还没有职业资产」是合法状态，前端据此渲染空态页。
+    """
+    return ok(dump(career_assets.build_career_assets(get_store(), int(current_user["id"]))))
+
+
+@router.get("/home/summary")
+async def get_home_summary(current_user: dict = Depends(get_current_user)):
+    """首页摘要（P3-2）。
+
+    建议来自**最新分析已算出的 Gap actions** —— 首页不再额外花一次 LLM 调用，
+    也不产出没有数据支撑的文案。
+    """
+    return ok(dump(home.build_home_summary(get_store(), int(current_user["id"]))))
+
+
+@router.get("/profile")
+async def get_profile(current_user: dict = Depends(get_current_user)):
+    """「我的」身份资料（P3-3）。
+
+    ⚠️ 手机号**脱敏**下发（``138****0000``）：这个字段会渲染在屏幕上，
+    原样回显等于把完整身份标识写进每一次截图与录屏。
+    """
+    from app.core.auth_store import AuthStore
+
+    user_id = int(current_user["id"])
+    auth_user = AuthStore().get_by_id(user_id)
+    quota = get_store().get_quota(user_id)
+    return ok(dump(identity.build_user_profile(auth_user, quota)))

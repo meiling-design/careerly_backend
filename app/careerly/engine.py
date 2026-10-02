@@ -216,8 +216,27 @@ def run_analysis(
     resume_text: str,
     use_llm: bool = True,
     use_embedding: bool = True,
-) -> AnalysisProject:
+) -> tuple[AnalysisProject, dict]:
     """Run the matching engine for one pasted JD and map it to a project.
+
+    Returns ``(project, resume_profile)`` where ``resume_profile`` is the
+    engine's parsed resume (``ResumeProfile.model_dump()``, possibly ``{}``).
+
+    ⚠️ **Why the profile is returned instead of dropped (P3-1)**
+    -----------------------------------------------------------
+    Before P3 the parsed resume was used for capability scoring and then
+    discarded. But ``GET /api/v1/career/assets`` needs a *real* source for
+    work experiences / projects / skills — and re-parsing the resume on every
+    assets request would mean an LLM call per page view.
+
+    The parse already happens here, for free, inside the analysis the user
+    paid for. Persisting it is the difference between "职业资产 has a real
+    data source" and "职业资产 是 Mock".
+
+    Returning a tuple (rather than hanging the profile off ``AnalysisProject``)
+    keeps the wire contract untouched: ``resumeProfile`` is *not* a field of
+    ``AnalysisProject`` in ``schemas.py``, and adding one would change the
+    JSON the Flutter client already parses.
 
     Synchronous on purpose: the caller offloads it to a thread executor so the
     event loop is not blocked (see ``app/careerly/router.py``).
@@ -277,10 +296,19 @@ def run_analysis(
     project = build_project(
         title=title, raw_jd=raw_jd, match_results=results, capabilities=capabilities,
     )
+    # P3-1：把画像序列化后交给调用方持久化（职业资产的真实数据源）。
+    # 失败不得影响分析 —— 与成长记录同一纪律。
+    try:
+        profile_dump: dict = (
+            resume_profile.model_dump() if hasattr(resume_profile, "model_dump") else {}
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Careerly resume profile serialisation failed")
+        profile_dump = {}
     logger.info(
         "Careerly analysis done | %.1fs | session=%s | score=%s",
         time.time() - started,
         state.session_id,
         project.results[0].matches[0].score if project.results and project.results[0].matches else None,
     )
-    return project
+    return project, profile_dump

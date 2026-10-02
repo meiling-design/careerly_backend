@@ -29,9 +29,10 @@ JD = (
 t0 = time.time()
 from app.careerly.engine import run_analysis
 
-project = run_analysis(title="高级后端工程师", raw_jd=JD, resume_text=resume_text)
+project, resume_profile = run_analysis(title="高级后端工程师", raw_jd=JD, resume_text=resume_text)
 print(f"REAL RUN OK — {time.time() - t0:.1f}s")
 print("project :", project.id, "|", project.name)
+print("profile :", sorted(resume_profile.keys()) or "(empty — parser degraded)")
 print("job     :", project.jobs[0].title, "| source =", project.jobs[0].source)
 m = project.results[0].matches[0]
 print("match   : score=%d rank=%d" % (m.score, m.rank))

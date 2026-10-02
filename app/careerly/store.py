@@ -494,6 +494,38 @@ class CareerlyStore:
         ).fetchone()
         if row is None:
             return None
+        return self._snapshot_row(row)
+
+    def get_previous_snapshot(self, user_id: int, snapshot_id: str) -> Optional[dict[str, Any]]:
+        """The snapshot immediately **before** ``snapshot_id``, or None.
+
+        P3-1：``CareerAssets.capabilities`` 需要 ``previousScore`` 才能算出
+        ``delta``。按「比目标快照更早」而不是「第二新」来取 —— 两者在只有
+        两条快照时结果相同，但前者在用户并发分析 / 补写历史时不会取错基准。
+
+        ⚠️ 排序键必须与 :meth:`get_latest_snapshot` 完全一致
+        （``created_at DESC, id DESC``），否则「上一条」在时间戳相同时会漂移，
+        导致同一个 ``delta`` 两次请求算出不同结果。
+        """
+        conn = _get_conn(self.db_path)
+        target = conn.execute(
+            "SELECT created_at FROM capability_snapshots WHERE id = ? AND user_id = ?",
+            (snapshot_id, user_id),
+        ).fetchone()
+        if target is None:
+            return None
+        row = conn.execute(
+            "SELECT * FROM capability_snapshots WHERE user_id = ? "
+            "  AND (created_at < ? OR (created_at = ? AND id < ?)) "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (user_id, target["created_at"], target["created_at"], snapshot_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._snapshot_row(row)
+
+    @staticmethod
+    def _snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "id": row["id"],
             "source": row["source"],
@@ -501,6 +533,52 @@ class CareerlyStore:
             "scores": _unjson(row["scores"], {}),
             "createdAt": iso(row["created_at"]),
         }
+
+    def list_capabilities(self, user_id: int) -> list[dict[str, Any]]:
+        """Current capability profile with deltas vs the previous snapshot (P3-1/2).
+
+        Returns ``[{"name": str, "score": int, "delta": int, "previousScore": int|None}]``
+        — the shape ``CareerAssets.capabilities`` needs.
+
+        ⚠️ Lives on the store (not in ``assets.py``) because **both**
+        ``career/assets`` and ``home/summary`` need it. Deriving it twice would
+        let the two screens disagree about whether a score went up — exactly
+        the kind of drift the diff-based event model exists to prevent.
+
+        Returns ``[]`` when there is no snapshot, or when the newest one has an
+        empty capability set (C4 degraded) — 「还没有能力画像」 is a legitimate
+        state, not an error.
+        """
+        latest = self.get_latest_snapshot(user_id)
+        if not latest:
+            return []
+        scores: dict[str, Any] = (latest.get("scores") or {}).get("capabilities") or {}
+        if not scores:
+            return []
+
+        previous = self.get_previous_snapshot(user_id, latest["id"])
+        prev_scores: dict[str, Any] = (
+            (previous.get("scores") or {}).get("capabilities") or {} if previous else {}
+        )
+
+        out: list[dict[str, Any]] = []
+        for name, score in scores.items():
+            try:
+                score_int = int(score)
+            except (TypeError, ValueError):
+                continue
+            before = prev_scores.get(name)
+            try:
+                before_int = int(before) if before is not None else None
+            except (TypeError, ValueError):
+                before_int = None
+            out.append({
+                "name": str(name),
+                "score": score_int,
+                "delta": (score_int - before_int) if before_int is not None else 0,
+                "previousScore": before_int,
+            })
+        return out
 
     def save_growth_events(self, user_id: int, events: list[dict[str, Any]]) -> None:
         """Persist derived events. ``events`` items: type/title/description/delta/occurred_at(float)."""

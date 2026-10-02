@@ -106,7 +106,7 @@ def _fake_project() -> object:
 
 
 def test_success_leaves_a_completed_task(client, careerly_store, monkeypatch):
-    monkeypatch.setattr(careerly_router, "run_analysis", lambda **kw: _fake_project())
+    monkeypatch.setattr(careerly_router, "run_analysis", lambda **kw: (_fake_project(), {}))
     h = _headers(client, "13900000001")
 
     r = client.post(
@@ -130,7 +130,7 @@ def test_success_leaves_a_completed_task(client, careerly_store, monkeypatch):
 
 
 def test_success_task_is_readable_by_id(client, careerly_store, monkeypatch):
-    monkeypatch.setattr(careerly_router, "run_analysis", lambda **kw: _fake_project())
+    monkeypatch.setattr(careerly_router, "run_analysis", lambda **kw: (_fake_project(), {}))
     h = _headers(client, "13900000002")
 
     client.post("/api/v1/analysis",
@@ -202,7 +202,7 @@ def test_missing_resume_is_no_baseline(client, careerly_store):
 
 def test_quota_rejection_is_recorded(client, careerly_store, monkeypatch):
     """配额不足同样留痕：这是撞到免费墙的直接证据，P5 监控需要它。"""
-    monkeypatch.setattr(careerly_router, "run_analysis", lambda **kw: _fake_project())
+    monkeypatch.setattr(careerly_router, "run_analysis", lambda **kw: (_fake_project(), {}))
     h = _headers(client, "13900000009")
 
     for _ in range(careerly_store.FREE_ANALYSIS_QUOTA):
@@ -249,7 +249,7 @@ def test_ask_user_maps_to_need_more_input(client, careerly_store, monkeypatch):
 
 
 def test_tasks_are_scoped_to_their_owner(client, careerly_store, monkeypatch):
-    monkeypatch.setattr(careerly_router, "run_analysis", lambda **kw: _fake_project())
+    monkeypatch.setattr(careerly_router, "run_analysis", lambda **kw: (_fake_project(), {}))
     a = _headers(client, "13900000007", "A")
     b = _headers(client, "13900000008", "B")
 

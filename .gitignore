@@ -19,6 +19,9 @@ venv/
 app/data/uploads/*
 app/data/outputs/*
 
+# OCR 语言包（chi_sim，~2.5MB 二进制）—— 不进仓库，见 app/data/tessdata/README.md
+app/data/tessdata/*.traineddata
+
 # Keep folders
 !app/data/uploads/.gitkeep
 !app/data/outputs/.gitkeep

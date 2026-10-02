@@ -16,6 +16,16 @@ pdfplumber>=0.10             # PDF parsing
 python-docx>=1.1             # DOCX parsing
 trafilatura>=1.6             # web text extraction
 
+# ── OCR（简历图片 / 截图 / 扫描件）───────────────────────────────
+# ⚠️ 还需要系统装 tesseract 二进制 + chi_sim 语言包，
+#    见 app/data/tessdata/README.md（pip 装不到这两样）。
+pytesseract>=0.3.10          # tesseract 的 python 壳
+pdf2image>=1.17              # 扫描件 PDF → 图片（依赖 poppler）
+Pillow>=10.0                 # 图片读取
+
+# ── multipart/form-data（简历文件上传）───────────────────────────
+python-multipart>=0.0.9      # FastAPI UploadFile / Form 需要
+
 # ── Browser Automation ───────────────────────────────────────────
 playwright>=1.40             # dynamic page crawling
 

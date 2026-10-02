@@ -10,6 +10,8 @@ Endpoints (all require a JWT via ``get_current_user``):
     GET  /api/v1/analysis/projects/{pid}     one project (jobs + versioned results)
     GET  /api/v1/analysis/tasks              list own analysis tasks (P1-1a 可观测)
     GET  /api/v1/analysis/tasks/{tid}        one task (ownership-scoped)
+    POST /api/v1/resume                      submit a resume asset (file/image/text)
+                                             → parse → establish Career Baseline
     PUT  /api/v1/resume                      save resume baseline text (P3 preview)
     GET  /api/v1/resume                      read resume baseline
     GET  /api/v1/quota                       QuotaState (Baseline §5: free 3)
@@ -26,10 +28,13 @@ thread executor so the event loop stays responsive during the 10–20s run.
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from functools import partial
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 
+from app.agents.resume_agent import ResumeAgent, ResumeExtractionError
 from app.api.envelope import err, ok
 from app.core.security import get_current_user
 from app.careerly import assets as career_assets
@@ -195,6 +200,143 @@ async def get_task(
 
 
 # ── Resume baseline ────────────────────────────────────────────────────────
+#
+# ## 简历资产的两个入口（2026-10-02）
+#
+# | 端点 | 语义 | 解析？ | 写 profile？ |
+# |---|---|---|---|
+# | `POST /resume` | **提交一份简历资产**（文件 / 图片 / 文本） | ✅ 立即解析 | ✅ |
+# | `PUT  /resume` | 仅更新基线文本（P3 preview，无解析） | ❌ | ❌ |
+#
+# ⚠️ **`POST /resume` 是唯一推荐的入口**。三种「输入方式」
+# （粘贴文本 / 文件 / 截图 OCR）在这里汇合：它们只差**文本怎么读出来**，
+# 之后的 `ResumeAgent` 解析与 `careerly_resumes` 落库是**同一段代码**。
+# 不存在第二套 Profile 写入逻辑。
+#
+# ⚠️ **两者都不扣分析额度**（`CLAUDE.md` §5.2：上传简历不扣额度）。
+
+#: 简历资产入口接受的文件类型。
+#:
+#: ⚠️ 与 Flutter `ResumeFileData.allowedExtensions` **必须一致**。
+#: 历史包袱：`/resume/upload`（`app/api/router_app.py`）只收 pdf/docx/txt，
+#: 而 Flutter 的选择器放行 `.doc` —— 两边对不上。这里统一以
+#: **ResumeAgent 真能解析的格式**为准（`.doc` 是旧二进制格式，
+#: python-docx 读不了，故不收）。
+_ALLOWED_RESUME_SUFFIXES = frozenset(
+    {".pdf", ".docx", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+)
+
+#: 与 `CLAUDE.md` / Figma 一致的上限（10MB）。
+_RESUME_MAX_BYTES = 10 * 1024 * 1024
+
+
+@router.post("/resume")
+async def create_resume_asset(
+    file: UploadFile | None = File(default=None),
+    text: str | None = Form(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """提交一份简历资产 → 解析 → 建立 / 更新职业基线。
+
+    ``multipart/form-data``，二选一：
+
+    * ``file`` —— PDF / DOCX / TXT / 图片（截图）。图片走 OCR。
+    * ``text`` —— 直接粘贴的简历文本。
+
+    返回体与 ``GET /resume`` **同形**（``{text, profile, updatedAt}``），
+    调用方拿到后无需再发一次 GET。
+
+    ⚠️ **不扣分析额度**，**不建分析任务** —— 这不是分析，
+    是 PRD §7.2 的「建立职业基线」。
+    """
+    store = get_store()
+    user_id = int(current_user["id"])
+
+    # ── 1. 取文本：文件与粘贴文本在这里合流 ────────────────────────────
+    cleanup: tempfile.TemporaryDirectory | None = None
+    agent = ResumeAgent()
+
+    try:
+        if file is not None and file.filename:
+            suffix = Path(file.filename).suffix.lower()
+            if suffix not in _ALLOWED_RESUME_SUFFIXES:
+                return err(
+                    "UNSUPPORTED_FORMAT",
+                    f"不支持的文件类型 {suffix or '(无扩展名)'}："
+                    f"支持 {' / '.join(sorted(_ALLOWED_RESUME_SUFFIXES))}",
+                    422,
+                )
+
+            content = await file.read()
+            if not content:
+                return err("VALIDATION_ERROR", "文件内容为空", 422)
+            if len(content) > _RESUME_MAX_BYTES:
+                return err("FILE_TOO_LARGE", "文件超过 10MB 上限", 413)
+
+            # ResumeAgent 按路径读文件（pdfplumber / python-docx / PIL 都要路径），
+            # 故先落临时文件，解析完立刻整目录删除。
+            cleanup = tempfile.TemporaryDirectory(prefix="careerly-resume-")
+            tmp_path = Path(cleanup.name) / f"resume{suffix}"
+            tmp_path.write_bytes(content)
+
+            profile = await agent.run(file_path=str(tmp_path), use_llm=True)
+
+        elif text is not None and text.strip():
+            profile = await agent.run(text=text.strip(), use_llm=True)
+
+        else:
+            return err("VALIDATION_ERROR", "请提供 file 或 text 其中之一", 422)
+
+    except ResumeExtractionError as exc:
+        logger.warning("Careerly resume asset failed | user=%d | code=%s | %s",
+                       user_id, exc.code, exc.message)
+        return err(exc.code, exc.message, 422)
+    except Exception as exc:  # pragma: no cover - unexpected extractor crash
+        logger.exception("Careerly resume asset crashed | user=%d", user_id)
+        return err("PARSE_ERROR", f"简历解析失败：{exc}", 500)
+    finally:
+        if cleanup is not None:
+            cleanup.cleanup()
+
+    resume_text = (agent.raw_text or "").strip()
+    if not resume_text:
+        # ResumeAgent 只在文本真的为空时才会走到这里，属防御性兜底。
+        return err("EMPTY_EXTRACTION", "未能提取到简历文本", 422)
+
+    profile_dump = (
+        profile.model_dump() if hasattr(profile, "model_dump") else {}
+    )
+
+    # ── 2. 落库：text 是权威，profile 是它的派生缓存 ────────────────────
+    #
+    # ⚠️ **只在画像「有结构」时覆盖已有 profile** —— 沿用 `POST /analysis`
+    # 同一条纪律（见该处注释）：解析偶尔会降级成只有 raw_text 的空壳，
+    # 用空壳覆盖已有画像会让「我的 → 职业资产」突然清零。
+    existing = store.get_resume(user_id) or {}
+    structured = any(
+        profile_dump.get(key)
+        for key in ("skills", "roles", "projects", "education", "certifications")
+    )
+
+    if structured:
+        store.save_resume(user_id, resume_text, profile_dump)
+    else:
+        logger.warning(
+            "Careerly resume asset produced no structured profile | user=%d "
+            "| keeping previous profile", user_id,
+        )
+        store.save_resume(user_id, resume_text, existing.get("profile") or {})
+
+    saved = store.get_resume(user_id) or {}
+    logger.info(
+        "Careerly resume asset saved | user=%d | chars=%d | structured=%s",
+        user_id, len(resume_text), structured,
+    )
+    return ok({
+        "text": saved.get("text", resume_text),
+        "profile": saved.get("profile", {}),
+        "updatedAt": saved.get("updatedAt"),
+    })
 
 
 @router.put("/resume")
@@ -204,11 +346,21 @@ async def save_resume(
 ):
     """Persist the resume baseline text used by every analysis (P3 preview).
 
-    ⚠️ **Does not touch ``profile``** (P3-1). The parsed profile is written by
-    ``POST /analysis`` (the only place that actually parses). Saving new text
-    here must not wipe it — otherwise "粘贴简历" would silently reset
+    ⚠️ **Does not touch ``profile``**. Saving new text here must not wipe the
+    parsed profile — otherwise the text would silently reset
     「我的 → 职业资产」to empty, and re-saving identical text would look like
     the user lost their assets.
+
+    ⚠️ **这不是建立职业资产的路径**。``profile`` 有两个写入者，都在别处：
+
+    | 写入者 | 时机 |
+    |---|---|
+    | ``POST /api/v1/resume`` | 用户提交简历资产（文件 / 图片 / 文本）时**立即**解析 |
+    | ``POST /api/v1/analysis`` | 分析链路内顺带解析（P3-1） |
+
+    （2026-10-02 修订：本条原写「``POST /analysis`` 是唯一解析方」。新增
+    简历资产入口后不再成立 —— 只走完 Onboarding、没做过分析的新用户，
+    其「职业资产」也需要有真实数据。）
     """
     text = (body.get("text") or "").strip() if isinstance(body, dict) else ""
     if not text:

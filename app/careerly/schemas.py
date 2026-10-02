@@ -130,6 +130,34 @@ class AnalyzeRequest(BaseModel):
     resumeText: Optional[str] = None
 
 
+class ParseJobUrlRequest(BaseModel):
+    """`POST /api/v1/analysis/jobs/parse-url` 请求体（backend-only）。
+
+    ⚠️ 与 [AnalyzeRequest] 一样**不在 Dart 契约文档里** ——
+    它是 P4-③ 新增的能力，契约文档由另一侧维护，本文件不自作主张改它。
+    """
+
+    url: str = Field(..., min_length=1, max_length=2000)
+
+
+class ParsedJob(BaseModel):
+    """一条**从链接抓取得到的岗位**（`lib/data/models/parsed_job.dart`）。
+
+    只承载「回填 JD 文本框」所需的最小字段：
+    前端拿到它就把 ``description`` 填进 JD 输入框、``title`` 填进岗位名，
+    用户**看得到、改得动**，之后仍走原来的「开始分析」链路。
+
+    刻意**不返回** CrawlAgent 的全部字段（skills / location / department …）：
+    匹配计算在后端自己会重新解析 JD，前端多拿这些只会诱使 UI 去展示
+    尚未被产品确认的字段。
+    """
+
+    url: str
+    title: str
+    company: str = ""
+    description: str
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Resume — versions / profile
 # ══════════════════════════════════════════════════════════════════════════

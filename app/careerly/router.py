@@ -8,6 +8,7 @@ Endpoints (all require a JWT via ``get_current_user``):
     POST /api/v1/analysis                    analyze({title, rawJd}) — synchronous
     GET  /api/v1/analysis/projects           list analysis projects
     GET  /api/v1/analysis/projects/{pid}     one project (jobs + versioned results)
+    POST /api/v1/analysis/jobs/parse-url     crawl a job URL → backfill the JD box (③)
     GET  /api/v1/analysis/tasks              list own analysis tasks (P1-1a 可观测)
     GET  /api/v1/analysis/tasks/{tid}        one task (ownership-scoped)
     POST /api/v1/resume                      submit a resume asset (file/image/text)
@@ -40,7 +41,8 @@ from app.core.security import get_current_user
 from app.careerly import assets as career_assets
 from app.careerly import growth, home, identity
 from app.careerly.engine import AnalysisError, run_analysis
-from app.careerly.schemas import AnalyzeRequest, dump
+from app.careerly.job_import import JobImportError, fetch_job_from_url
+from app.careerly.schemas import AnalyzeRequest, ParseJobUrlRequest, dump
 from app.careerly.store import CareerlyStore
 from app.utils.logger import logger
 
@@ -156,6 +158,33 @@ async def list_job_library(
     store = get_store()
     jobs = store.list_jobs(int(current_user["id"]), limit=min(max(limit, 1), 200))
     return ok([dump(j) for j in jobs])
+
+
+@router.post("/analysis/jobs/parse-url")
+async def parse_job_url(
+    req: ParseJobUrlRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """③ 岗位 URL：抓取链接 → 回填 JD 文本框。
+
+    **不是**分析：不扣额度、不建分析任务、不写任何库
+    （Baseline §5 / CLAUDE.md §5.2 —— 只有「开始分析」扣额度）。
+    细节与「为什么不让 /analysis 收 URL」见 ``app/careerly/job_import.py``。
+    """
+    user_id = int(current_user["id"])
+    try:
+        parsed = await fetch_job_from_url(req.url)
+    except JobImportError as exc:
+        logger.warning(
+            "Careerly parse-job-url failed | user=%d | code=%s | url=%s",
+            user_id, exc.code, req.url[:120],
+        )
+        return err(exc.code, exc.message, exc.status_code)
+    except Exception as exc:  # pragma: no cover - unexpected crawler crash
+        logger.exception("Careerly parse-job-url crashed | user=%d", user_id)
+        return err("JOB_FETCH_FAILED", f"岗位链接抓取失败：{exc}", 502)
+
+    return ok(dump(parsed))
 
 
 @router.get("/analysis/projects/{project_id}")

@@ -158,6 +158,39 @@ class ParsedJob(BaseModel):
     description: str
 
 
+class AiHistoryMessage(BaseModel):
+    """一条**已发生**的对话轮次，由客户端回传（backend-only）。
+
+    会话历史存在**客户端本地**（裁决 2026-10-03 ②），后端不留存，
+    因此多轮上下文靠请求体带回来。``role`` 只接受 ``user`` / ``assistant``
+    —— 服务端在 ``LLMService.chat_stream`` 里会再过滤一次，这里限制
+    长度是为了让超长请求在 FastAPI 校验层就被拒，而不是拖到 LLM 调用。
+    """
+
+    role: str = Field(..., pattern="^(user|assistant)$")
+    content: str = Field(..., max_length=8000)
+
+
+class AiMessageRequest(BaseModel):
+    """`POST /api/v1/ai/messages` 请求体（backend-only，不在 Dart 契约文档里）。
+
+    ⚠️ **不带 user id** —— 用户身份一律取自 JWT（``get_current_user``），
+    客户端传什么都不影响数据作用域（``CareerlyStore.get_project`` 在 SQL
+    里按 ``user_id`` 过滤）。
+    """
+
+    message: str = Field(..., min_length=1, max_length=4000)
+
+    #: 入口带参：从岗位详情 / 分析结果进入时携带。缺省则回退最近一次分析。
+    projectId: Optional[str] = None
+
+    #: 入口带参：聚焦到某一个岗位的匹配结果（可选）。
+    jobId: Optional[str] = None
+
+    #: 本次会话此前的轮次（客户端本地存储，随请求回传）。
+    history: list[AiHistoryMessage] = Field(default_factory=list)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Resume — versions / profile
 # ══════════════════════════════════════════════════════════════════════════

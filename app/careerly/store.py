@@ -139,6 +139,17 @@ class CareerlyStore:
                 is_member INTEGER NOT NULL DEFAULT 0
             );
 
+            -- AI 对话额度 —— **独立于** user_quota（裁决 2026-10-03 ②）。
+            -- §5.2 的「免费 3 次完整分析」一字不动；AI 单独计数。
+            -- 与 user_quota 分开建表而不是加列，是为了让两个池的
+            -- 「总量 / 是否会员豁免」能各自演进，不互相牵连。
+            CREATE TABLE IF NOT EXISTS user_ai_quota (
+                user_id   INTEGER PRIMARY KEY,
+                total     INTEGER NOT NULL DEFAULT 50,
+                used      INTEGER NOT NULL DEFAULT 0,
+                is_member INTEGER NOT NULL DEFAULT 0
+            );
+
             -- P1-1a：分析任务的运行记录。
             -- ⚠️ 这是「这一次分析跑到哪了」的可观测记录，不是业务数据本体
             -- （业务本体在 analysis_projects）。D-A ②双模的第一阶段：
@@ -369,6 +380,45 @@ class CareerlyStore:
         )
         conn.execute(
             "UPDATE user_quota SET used = used + 1 WHERE user_id = ? AND is_member = 0",
+            (user_id,),
+        )
+        conn.commit()
+
+    # ── AI 对话额度（独立池，裁决 2026-10-03 ②）──────────────────────────
+    #
+    # ⚠️ 暂定值 · 待产品裁决
+    # 裁决只定了「AI 额度**独立于**分析额度、§5.2 不动」，
+    # **没有**定具体免费次数。这个数字只用于让「检查 / 扣减」链路
+    # 真实可跑，**不是产品规则**；产品侧定了数字后改这一处即可
+    # （表默认值同步改 `_init_schema`）。
+
+    FREE_AI_QUOTA = 50
+
+    def get_ai_quota(self, user_id: int) -> QuotaState:
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT * FROM user_ai_quota WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            return QuotaState(total=self.FREE_AI_QUOTA, used=0, isMember=False)
+        return QuotaState(
+            total=row["total"], used=row["used"], isMember=bool(row["is_member"])
+        )
+
+    def consume_ai_quota(self, user_id: int) -> None:
+        """Deduct one AI message. Only call AFTER the answer streamed cleanly.
+
+        与 `consume_quota` 同一纪律：**先检查、后扣减、只有成功才扣**。
+        失败（含流中断）不扣 —— 用户没有拿到回答，不该付这次数。
+        """
+        conn = _get_conn(self.db_path)
+        conn.execute(
+            "INSERT OR IGNORE INTO user_ai_quota (user_id, total, used, is_member) "
+            "VALUES (?, ?, 0, 0)",
+            (user_id, self.FREE_AI_QUOTA),
+        )
+        conn.execute(
+            "UPDATE user_ai_quota SET used = used + 1 WHERE user_id = ? AND is_member = 0",
             (user_id,),
         )
         conn.commit()

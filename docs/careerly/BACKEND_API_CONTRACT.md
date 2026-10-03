@@ -20,7 +20,7 @@
 | C1 | **认证身份字段**：手机号（D85）vs 邮箱+密码 | ✅ **已裁决**：手机号直登，`DEV 可用 / PROD 硬阻断`（D-NEW 方案 A）。`app/core/auth_mode.py` 导入期 fail-fast |
 | C2 | 分析调用形态：同步 vs 异步 | ✅ **已裁决 D-A ②**：对外同步（Flutter 零改动），内部保留任务状态机便于升级异步 |
 | C3 | 额度规则 | ✅ **已落地**：`careerly.db: user_quota`（免费 3 次），仅分析**成功**后扣减，失败不扣 |
-| C4 | 能力分值模型缺失 | ✅ **已落地**：`LLMService.score_capabilities()` + `capability.normalize()` 严格校验 + 完整降级。🔧 **P1-5 修复了一处取值 bug**（见 §0.5.5） |
+| C4 | 能力分值模型缺失 | ✅ **已落地**：`LLMService.score_capabilities()` + `capability.normalize()` 严格校验 + 完整降级。🔧 **P1-5 修复了一处取值 bug**（见 §0.5.6） |
 | C5 | 会话持久化 → user_id 隔离无处落地 | ✅ **已落地**：**D-B 推翻 D52** —— token 安全持久化（Android Keystore / iOS Keychain），refresh 90 天。冷启动不再丢失身份主体 |
 
 ---
@@ -46,7 +46,7 @@
 | `AnalysisRepository.fetchProjects` | `GET /api/v1/analysis/projects` | JWT | |
 | `AnalysisRepository.fetchProject` | `GET /api/v1/analysis/projects/{id}` | JWT | 越权 → 404 |
 | `AnalysisRepository.fetchJobLibrary` | `GET /api/v1/analysis/jobs` | JWT | |
-| `AnalysisRepository.fetchQuota` | `GET /api/v1/quota` | JWT | ⚠️ 路径与 §1 草案不同，见 §0.5.4 |
+| `AnalysisRepository.fetchQuota` | `GET /api/v1/quota` | JWT | ⚠️ 路径与 §1 草案不同，见 §0.5.5 |
 
 > 另有 `POST /api/v1/auth/refresh`（刷新令牌）与 `GET /api/v1/auth/me`，由 `ApiClient`
 > 在 401 时自动调用，Flutter Repository 层不直接感知。
@@ -58,8 +58,19 @@
 | `GET /api/v1/analysis/tasks` | ✅ 已建（P1-1a） | Flutter 未接；等 P1-1b 定「要不要轮询」 |
 | `GET /api/v1/analysis/tasks/{id}` | ✅ 已建（P1-1a） | 同上 |
 | `POST /api/v1/resume/upload` | ✅ 已建（multipart） | **Flutter 明确不接**：单版本基线用文本即可，文件上传排 P3 |
-| `GET /api/v1/growth/events?type=&limit=` | ✅ 已建（P2-4） | Flutter 已接（P2-5，`ApiGrowthRepository`） |
-| `GET /api/v1/growth/timeline?from=&to=` | ✅ 已建（P2-4） | 同上 |
+| `POST /api/v1/ai/messages` | ✅ 已建（P-AI-1, 2026-10-03） | 曾因「AI 能力边界未定」暂缓（P3-4）。边界已于 2026-10-03 裁决并实现，完整契约见 **§0.5.8** |
+
+### 0.5.3 P3 新增：已落地且已对接（2026-10-02 回写）
+
+以下 3 个端点 + P2 的 growth 两端点，使 Flutter 除 AI 外**全部切真**。
+
+| Flutter 侧 | 方法与路径 | 鉴权 | 数据源与口径 |
+|---|---|---|---|
+| `GrowthRepository.fetchEvents` | `GET /api/v1/growth/events?type=&limit=` | JWT | 相邻能力快照 diff 派生（P2-4/5，已上线） |
+| `GrowthRepository.fetchTimeline` | `GET /api/v1/growth/timeline?from=&to=` | JWT | 同上 |
+| `CareerAssetsRepository.fetchAssets` | `GET /api/v1/career/assets` | JWT | 最新分析持久化的结构化简历画像 + 最新/次新能力快照 diff（`app/careerly/assets.py`）。时间字段只填真实可得项，解析不到的留空，**不伪造** |
+| `HomeRepository.fetchSummary` | `GET /api/v1/home/summary` | JWT | headline/建议由最新分析匹配分与真实 Gap 派生；`dailyContent` 无来源，下发 `null`（`app/careerly/home.py`） |
+| `ProfileRepository.fetchUserProfile` | `GET /api/v1/profile` | JWT | auth.db users 表；`handle` 为**脱敏**手机号（`139****0002`），完整号码不下发（`app/careerly/identity.py`） |
 
 > **P2 事件派生口径（2026-10-01 裁决）**：事件由「相邻两条 `capability_snapshots`
 > diff」在分析成功时派生（`app/careerly/growth.py`）。首次分析产生一条
@@ -68,17 +79,13 @@
 > 即 roadmap 标注的 P2-6 产品语义开放项，待职业资产接真源时单独对齐。
 > 非法 `type` 返回 422 `INVALID_TYPE`；非法/倒置时间区间返回 422 `INVALID_RANGE`。
 
-### 0.5.3 目标态（契约里有、后端未建）
+### 0.5.4 目标态（契约里有、后端未建）
 
 | §1 契约要求 | 计划 | 阻塞什么 |
 |---|---|---|
-| `GET/POST /api/v1/resume/versions`、`versions/{id}/current` | **P3** | 简历多版本对比 |
-| `GET /api/v1/career/assets` | **P3** | 「我的」职业资产 |
-| `GET /api/v1/home/summary` | **P3** | 首页真实数据 |
-| `GET /api/v1/profile` | **P3** | 「我的」身份资料 |
-| `POST /api/v1/ai/messages` | **P3** | AI 对话 |
+| `GET/POST /api/v1/resume/versions`、`versions/{id}/current` | P4+ | 简历多版本对比 |
 
-### 0.5.4 ⚠️ 路径分歧（契约草案 ≠ 实际实现）
+### 0.5.5 ⚠️ 路径分歧（契约草案 ≠ 实际实现）
 
 **这些都是 Flutter 已按「实际实现」写好的**，回头要把 §1 的草案改过来，而不是改代码 ——
 否则会为了对齐文档把已经跑通的链路弄断。
@@ -91,7 +98,7 @@
 | `POST /api/v1/resume/baseline` | `GET /api/v1/resume`（无独立解析端点） | 改文档 |
 | `POST /api/v1/resume/file`（multipart） | `POST /api/v1/resume/upload` | 改文档 |
 
-### 0.5.5 P1-5 发现并修复的阻断性 Bug（值得记一笔）
+### 0.5.6 P1-5 发现并修复的阻断性 Bug（值得记一笔）
 
 `run_analysis()` 取简历画像时写成 `state.resume`，而 `GraphState` 的字段名是
 `resume_output` → `AttributeError`。这行**不在** try 块内，异常一路冒到 router 兜底分支，
@@ -101,13 +108,94 @@
 `run_analysis` 整个 monkeypatch 掉了。P1-5 把替换点下移到模型供应商层后第一行就暴露。
 回归套件见 `tests/test_p1_engine_e2e.py`。
 
-### 0.5.6 历史别名（勿再新增调用）
+### 0.5.7 历史别名（勿再新增调用）
 
 根路径 `/health`、`/match`、`/sessions*`、`/sessions/{id}/report` 是 `/api/v1/*`
 的历史别名，**P1-3 已标记 `deprecated`**，错误格式也已与 `/api/v1/*` 统一（此前裸抛
 `HTTPException` 返回 `{"detail": ...}`）。保留是为了兼容 README 中的旧脚本（决策 D-H），
 但**两侧输入契约不同**（v1 侧强制 `job_urls` 非空且有 X-Client-Key / demo 配额 / 输入长度
 三重守门），故未合并实现，真正合并列 P4。
+
+### 0.5.8 P-AI-1 落地：`POST /api/v1/ai/messages`（2026-10-03）
+
+> §0.5.2 / §0.5.4 曾把本端点标为「⏸ 未建 / 未排期」，理由是**AI 能力边界未定**
+> （上下文含什么、token 成本、Prompt 注入防护）。该边界已于 **2026-10-03** 裁决，
+> 端点已实现并进入回归套件。**本小节是它的契约** —— 它与 §1 / §2.12 的旧草案
+> **形状不同**（那里写的是单次 `AIMessage`，这里是 SSE 流）。
+
+#### 请求
+
+```json
+POST /api/v1/ai/messages          Authorization: Bearer <JWT>
+{
+  "message": "为什么这个岗位只有 78%？",   // 必填，1–4000 字
+  "projectId": "p_abc",                  // 可选；缺省回退「最近一次分析」
+  "jobId": "j_7",                        // 可选；聚焦某个岗位的匹配结果
+  "history": [                           // 可选；客户端本地会话，随请求回传
+    {"role": "user", "content": "…"},
+    {"role": "assistant", "content": "…"}
+  ]
+}
+```
+
+⚠️ **请求体里没有 user id** —— 身份一律取自 JWT，数据作用域在 SQL 层按 `user_id` 过滤
+（`CareerlyStore.get_project`）。`history[].role` 只接受 `user` / `assistant`，
+出现 `system` → 422（注入边界）。
+
+⚠️ **客户端不上传 Career Context**，只带 `projectId`。会话历史存**客户端本地**，
+后端不留存会话 —— 多轮上下文靠 `history` 回传。
+
+#### Current Context（服务端组装）
+
+服务端按 `projectId` **重新取数**再组装，而不是收下客户端传来的一份快照 ——
+这样用户更新简历后，对话里不会还拿着几个月前的旧数据。
+
+| 层 | 内容 | 本轮 |
+|---|---|---|
+| **Current Context** | 当前简历画像 · 当前 JD（截断 4000 字）· 当前分析结果 · 匹配度 · 能力模型（capabilitySnapshot）· Gap / GapDetail · AI 建议 · 同项目其它岗位摘要 | ✅ 已实现 |
+| **Historical Context** | 历史简历版本 / 历史岗位 / 能力变化 / 历史分析 | ❌ **暂不实现**（「按问题召回」留后续单独开发，本轮不做 RAG / 向量库） |
+
+组装入口 `app/careerly/ai_context.py::build_current_context` —— **只读已落库的事实，
+不重算分数，不额外调用 LLM 检索**。
+
+`projectId` 为空 → 回退该用户**最近一次分析**；一次分析都没有 → 通用顾问
+（**合法状态，不是错误**，不返回 4xx）。
+
+#### 响应：SSE（`Content-Type: text/event-stream`）
+
+⚠️ **本端点是 Careerly 唯一响应不是 envelope 的端点。** 流一旦开始，HTTP 状态码就已经
+发出去了，没法再改成 403/404 —— 因此**前置失败返回普通 envelope**（见下表），
+只有**生成中途**的失败才走 SSE error 事件。
+
+| 帧 | 含义 |
+|---|---|
+| `{"type":"start"}` | 流开始 |
+| `{"type":"delta","text":"…"}` | 增量文本，可多次 |
+| `{"type":"done"}` | 正常结束 |
+| `{"type":"error","code":"…","message":"…"}` | **中途**失败（已发出的 delta 不撤回） |
+
+#### 前置 HTTP 错误（普通 envelope，非 SSE）
+
+| 状态 | code | 触发条件 |
+|---|---|---|
+| 403 | `AI_QUOTA_EXCEEDED` | AI 独立额度耗尽（`details.quota` 带快照） |
+| 404 | `PROJECT_NOT_FOUND` | 显式传了 `projectId` 但不存在 / 不属于该用户 —— **不静默回退** |
+| 503 | `AI_UNAVAILABLE` | 未配置 LLM（缺 `LLM_API_KEY` / `DASHSCOPE_API_KEY`） |
+| 422 | `VALIDATION_ERROR` | `message` 为空 / 超长 / `history[].role` 非法 |
+
+#### 额度
+
+- **独立池**：表 `user_ai_quota`，与 `user_quota`（`CLAUDE.md` §5.2「免费 3 次完整**分析**」）
+  **互不影响** —— 2026-10-03 裁决：§5.2 一字不动，AI 另开一池。
+- **成功才扣**：流正常 `done` 才扣 1 次；中途 error、或客户端断开，**均不扣**。
+- ⚠️ **免费次数未锁定**：MVP 沿用开发暂定值（登记在 Flutter 侧
+  `docs/05_progress/CURRENT_STATUS.md` §3.6），**不是**最终商业化额度。
+
+#### 实现位置
+
+`app/careerly/router.py::ai_messages` / `_ai_stream` · `app/careerly/ai_context.py` ·
+`app/careerly/store.py`（`get_ai_quota` / `consume_ai_quota`）·
+`app/services/llm_service.py::chat_stream` · 回归套件 `tests/test_p5_ai_messages.py`。
 
 ---
 
@@ -139,7 +227,7 @@
 | `CareerAssetsRepository.fetchAssets()` | `GET /api/v1/career/assets` | `CareerAssets` |
 | `HomeRepository.fetchSummary()` | `GET /api/v1/home/summary` | `HomeSummary` |
 | `ProfileRepository.fetchUserProfile()` | `GET /api/v1/profile` | `UserProfile` |
-| `AIRepository.sendMessage(text)` | `POST /api/v1/ai/messages` | `AIMessage` |
+| `AIRepository.sendMessage(text)` | `POST /api/v1/ai/messages` | ⚠️ **SSE 流，不是 `AIMessage`** —— 见 **§0.5.8** |
 | `AuthRepository.register({name, phone, email?})` | `POST /api/v1/auth/register` | `void` ⚠️C1 |
 | `AuthRepository.login({phone})` | `POST /api/v1/auth/login` | `void` ⚠️C1 |
 
@@ -298,6 +386,13 @@
 { "id": "string", "text": "string", "isUser": false, "createdAt": "ISO8601 | null" }
 ```
 （Dart 侧**无 `fromJson`**，是纯 Mock 内存模型；后端若要落库需先补序列化。）
+
+> ⚠️ **已过时（2026-10-03）** —— 这是 AI 尚为纯 Mock 时的**旧草案**，
+> 描述的是「一次请求换一条完整 `AIMessage`」。P-AI-1 落地后端点改为 **SSE 流**
+> （`start` / `delta` / `done` / `error`），且**会话不落后端库**
+> —— 历史存在客户端本地，由请求体 `history` 回传。当前契约见 **§0.5.8**。
+> `AIMessage` 作为**客户端本地**的消息模型仍然有效（存本地会话用），
+> 但它已**不是** `/ai/messages` 的响应体。
 
 ---
 

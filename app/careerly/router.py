@@ -16,6 +16,7 @@ Endpoints (all require a JWT via ``get_current_user``):
     PUT  /api/v1/resume                      save resume baseline text (P3 preview)
     GET  /api/v1/resume                      read resume baseline
     GET  /api/v1/quota                       QuotaState (Baseline §5: free 3)
+    POST /api/v1/ai/messages                 AI advisor — SSE streaming (P-AI-1)
     GET  /api/v1/growth/events               growth footprint events (P2-4)
     GET  /api/v1/growth/timeline             events within an occurredAt range (P2-4)
     GET  /api/v1/career/assets               CareerAssets — 「我的」职业资产 (P3-1)
@@ -29,21 +30,35 @@ thread executor so the event loop stays responsive during the 10–20s run.
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi.responses import StreamingResponse
 
 from app.agents.resume_agent import ResumeAgent, ResumeExtractionError
 from app.api.envelope import err, ok
 from app.core.security import get_current_user
 from app.careerly import assets as career_assets
 from app.careerly import growth, home, identity
+from app.careerly.ai_context import (
+    SYSTEM_PROMPT,
+    build_current_context,
+    build_user_prompt,
+)
 from app.careerly.engine import AnalysisError, run_analysis
 from app.careerly.job_import import JobImportError, fetch_job_from_url
-from app.careerly.schemas import AnalyzeRequest, ParseJobUrlRequest, dump
+from app.careerly.schemas import (
+    AiMessageRequest,
+    AnalyzeRequest,
+    ParseJobUrlRequest,
+    dump,
+)
 from app.careerly.store import CareerlyStore
+from app.services.llm_service import LLMService
 from app.utils.logger import logger
 
 router = APIRouter(prefix="/api/v1", tags=["careerly"])
@@ -516,3 +531,143 @@ async def get_profile(current_user: dict = Depends(get_current_user)):
     auth_user = AuthStore().get_by_id(user_id)
     quota = get_store().get_quota(user_id)
     return ok(dump(identity.build_user_profile(auth_user, quota)))
+
+
+# ── AI advisor（P-AI-1）────────────────────────────────────────────────────
+#
+# 裁决（2026-10-03）：Current Context / 客户端会话历史 / 独立额度 / 流式 SSE。
+# Historical Context 本轮不做（`ai_context.py` 的模块注释有边界说明）。
+#
+# ⚠️ 这是**唯一**响应不是 envelope 的 Careerly 端点 —— 流一旦开始，HTTP
+# 状态码就已经发出去了，没法再改成 403/404。因此所有**前置失败**
+# （额度、项目不存在、LLM 未配置）都必须在构造 StreamingResponse **之前**
+# 以普通 `err(...)` 返回；只有**生成中途**的失败才走 SSE error 事件。
+# 这个顺序与 `/match/stream` 一致（见 router_v1.py 的说明）。
+#
+# SSE 帧格式（前后端同一份约定）：
+#     {"type": "start"}                        流已开始
+#     {"type": "delta", "text": "…"}           增量文本，可多次
+#     {"type": "done"}                         正常结束
+#     {"type": "error", "code": "…", "message": "…"}   中途失败
+
+
+def _sse(payload: dict[str, Any]) -> str:
+    """一条 SSE 帧。不转义非 ASCII —— 中文在抓包里要能直读。"""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@router.post("/ai/messages", response_model=None)
+async def ai_messages(
+    req: AiMessageRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """AI 职业顾问：接收一个问题，流式返回回答。
+
+    上下文由**服务端**按 ``projectId`` 组装（见 ``ai_context.py``），
+    客户端**不**上传 Career Context —— 只带一个 id，避免拿到一份
+    几个月前的旧快照（裁决 2026-10-03 ②）。
+    """
+    store = get_store()
+    user_id = int(current_user["id"])
+
+    # ── 前置检查：全部在开流之前完成 ────────────────────────────────────
+    ai_quota = store.get_ai_quota(user_id)
+    if not ai_quota.isMember and ai_quota.used >= ai_quota.total:
+        return err(
+            "AI_QUOTA_EXCEEDED",
+            "AI 对话次数已用完，升级会员后可继续使用",
+            403,
+            details={"quota": dump(ai_quota)},
+        )
+
+    context = build_current_context(store, user_id, req.projectId, req.jobId)
+    if context is None and req.projectId:
+        # 显式带参却查不到 → 报错，**不**静默回退到最近一次分析：
+        # 否则用户以为在问 A 岗位，回答用的却是另一个项目的数据。
+        return err("PROJECT_NOT_FOUND", f"分析项目 {req.projectId} 不存在", 404)
+
+    try:
+        llm = LLMService()
+    except Exception as exc:
+        # 构造期就会因缺 API key 抛错（llm_service.py）。这是**部署配置**
+        # 问题，不是请求问题 —— 503 比 500 更诚实。
+        logger.error(
+            "Careerly ai/messages: LLM unavailable | user=%d | %s", user_id, exc
+        )
+        return err("AI_UNAVAILABLE", f"AI 服务未就绪：{exc}", 503)
+
+    user_prompt = build_user_prompt(context, req.message)
+    history = [turn.model_dump() for turn in req.history]
+
+    logger.info(
+        "Careerly ai/messages | user=%d | project=%s | job=%s | history=%d",
+        user_id,
+        (context or {}).get("analysis", {}).get("projectId"),
+        req.jobId,
+        len(history),
+    )
+
+    return StreamingResponse(
+        _ai_stream(llm, user_prompt, history, store, user_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _ai_stream(
+    llm: LLMService,
+    user_prompt: str,
+    history: list[dict],
+    store: CareerlyStore,
+    user_id: int,
+):
+    """把**同步**的 LLM 流桥接成 async SSE 生成器。
+
+    `LLMService` 用的是同步 OpenAI 客户端，直接在事件循环里
+    `for … in chat_stream()` 会把整个进程卡住（期间无法处理任何其它请求）。
+    因此放进线程执行，用 `asyncio.Queue` + `call_soon_threadsafe` 把增量
+    搬回事件循环 —— 与 `_progress_generator` 桥接同步引擎进度同一手法。
+    """
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    def produce() -> None:
+        try:
+            for text in llm.chat_stream(SYSTEM_PROMPT, user_prompt, history=history):
+                loop.call_soon_threadsafe(queue.put_nowait, ("delta", text))
+            loop.call_soon_threadsafe(queue.put_nowait, ("end", None))
+        except Exception as exc:  # 中途失败：只能以 SSE error 事件收尾
+            loop.call_soon_threadsafe(queue.put_nowait, ("error", str(exc)))
+
+    yield _sse({"type": "start"})
+    loop.run_in_executor(None, produce)
+
+    failed = False
+    while True:
+        kind, payload = await queue.get()
+        if kind == "delta":
+            yield _sse({"type": "delta", "text": payload})
+        elif kind == "error":
+            logger.error(
+                "Careerly ai stream failed | user=%d | %s", user_id, payload
+            )
+            yield _sse(
+                {
+                    "type": "error",
+                    "code": "AI_FAILED",
+                    "message": f"AI 回复中断：{payload}",
+                }
+            )
+            failed = True
+            break
+        else:
+            break
+
+    if not failed:
+        # 成功才扣 —— 与 consume_quota 同一纪律（用户没拿到回答不该付次数）。
+        store.consume_ai_quota(user_id)
+        yield _sse({"type": "done"})

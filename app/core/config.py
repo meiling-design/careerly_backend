@@ -61,7 +61,11 @@ class LLMConfig(BaseModel):
     api_key: str = Field(default_factory=lambda: os.getenv("LLM_API_KEY") or os.getenv("DASHSCOPE_API_KEY", ""))
     base_url: str = Field(default_factory=lambda: os.getenv("LLM_BASE_URL") or os.getenv("DASHSCOPE_BASE_URL", ""))
     temperature: float = 0.1
-    max_tokens: int = 4096
+    # qwen3.5-plus is a reasoning model: ~2.9k of the budget goes to
+    # reasoning_tokens before any JSON is emitted, and a single resume parse
+    # was measured at 3.5k completion tokens. 4096 left too little headroom
+    # and longer resumes would truncate mid-JSON.
+    max_tokens: int = 8192
 
 
 class EmbeddingConfig(BaseModel):

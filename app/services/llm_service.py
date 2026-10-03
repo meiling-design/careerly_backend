@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -12,6 +12,20 @@ from openai import OpenAI
 from app.utils.logger import logger
 
 load_dotenv()
+
+
+# ── Provider tuning ─────────────────────────────────────────────────────────
+
+#: 关闭推理链的 ``extra_body``（DashScope / Qwen 系列支持）。
+#:
+#: ``qwen3.5-plus`` 是**推理模型**，默认会先生成一整段思考链再给答案。
+#: 结构化**抽取**（简历 / JD → JSON）是确定性变换，不需要思考链 ——
+#: 开着它只会白白生成上千 reasoning token，把延迟推到分钟级。
+#:
+#: 实测（同一份简历，2026-10-03）：
+#:   开推理 199.2s / 3363 completion token
+#:   关推理   9.0s /  362 completion token，结构化输出逐字段一致
+_NO_THINKING: dict[str, Any] = {"enable_thinking": False}
 
 
 # ── System prompts (core assets, loaded from inline constants) ──────────────
@@ -155,12 +169,21 @@ class LLMService:
         api_key: str | None = None,
         base_url: str | None = None,
         temperature: float = 0.1,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         timeout: int = 120,
     ):
         self.model = model or os.getenv("LLM_MODEL", "qwen3.5-plus")
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # Whether the provider honours response_format={"type": "json_object"}.
+        # None = not tried yet. Once rejected we remember False so we don't
+        # pay for a doomed 400 on every single call.
+        self._json_mode: bool | None = None
+
+        # Whether the provider honours extra_body={"enable_thinking": False}.
+        # Same memoised-probe pattern as _json_mode: a non-Qwen provider would
+        # reject the unknown argument, and we must not pay that 400 per call.
+        self._no_thinking: bool | None = None
 
         base_url = base_url or os.getenv("LLM_BASE_URL") or os.getenv("DASHSCOPE_BASE_URL")
         api_key = api_key or os.getenv("LLM_API_KEY") or os.getenv("DASHSCOPE_API_KEY")
@@ -187,6 +210,7 @@ class LLMService:
         temperature: float | None = None,
         max_tokens: int | None = None,
         response_format: dict | None = None,
+        extra_body: dict | None = None,
     ) -> str:
         """Send a chat completion request.
 
@@ -212,6 +236,8 @@ class LLMService:
         }
         if response_format:
             kwargs["response_format"] = response_format
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         try:
             resp = self.client.chat.completions.create(**kwargs)
@@ -222,10 +248,155 @@ class LLMService:
             logger.error("LLM chat failed: %s", e)
             raise
 
+    def chat_stream(
+        self,
+        system: str,
+        user: str,
+        history: list[dict] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> Iterator[str]:
+        """Stream a chat completion, yielding text deltas as they arrive.
+
+        Used by the Careerly AI advisor (``POST /api/v1/ai/messages``), which
+        relays every delta to the client as an SSE event so the answer types
+        itself out rather than appearing all at once.
+
+        ⚠️ Only ``delta.content`` is yielded. ``qwen3.5-plus`` is a reasoning
+        model and also emits ``reasoning_content`` — that is the model thinking
+        out loud, and relaying it would leak the chain of thought into the UI.
+
+        ``history`` is the prior conversation (``[{"role", "content"}, …]``),
+        supplied by the client because conversation storage is client-side
+        (裁决 2026-10-03 ②). It is clamped here so a long chat cannot silently
+        blow up the token budget.
+        """
+        messages: list[dict] = [{"role": "system", "content": system}]
+        for turn in (history or [])[-self.MAX_HISTORY_TURNS:]:
+            role = turn.get("role")
+            content = turn.get("content")
+            # Silently drop anything that is not a plain user/assistant turn:
+            # a malformed role would be rejected by the API, and a "system"
+            # turn coming from the client is exactly the injection vector this
+            # boundary exists to close.
+            if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                messages.append({"role": role, "content": content[: self.MAX_HISTORY_CHARS]})
+        messages.append({"role": "user", "content": user})
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature or self.temperature,
+            "max_tokens": max_tokens or self.max_tokens,
+            "stream": True,
+        }
+
+        try:
+            stream = self.client.chat.completions.create(**kwargs)
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                text = getattr(chunk.choices[0].delta, "content", None)
+                if text:
+                    yield text
+        except Exception as e:
+            logger.error("LLM stream failed: %s", e)
+            raise
+
+    #: Streaming context bounds — implementation limits, not product rules.
+    MAX_HISTORY_TURNS = 20
+    MAX_HISTORY_CHARS = 4000
+
     def chat_json(self, system: str, user: str, **kwargs) -> dict:
-        """Chat and parse response as JSON."""
+        """Chat and parse the response as a JSON object.
+
+        Prefers the provider's JSON mode: constraining the decoder beats
+        repairing malformed output after the fact. If the provider rejects
+        ``response_format`` we fall back to a plain call and remember it, so
+        the penalty is paid at most once per process.
+        """
+        if self._json_mode is not False:
+            try:
+                raw = self.chat(
+                    system, user, response_format={"type": "json_object"}, **kwargs
+                )
+                self._json_mode = True
+                return self._safe_json(raw)
+            except Exception as exc:
+                if not self._json_mode_unsupported(exc):
+                    raise
+                logger.warning(
+                    "Provider rejected response_format=json_object, "
+                    "falling back to plain chat: %s",
+                    exc,
+                )
+                self._json_mode = False
+
         raw = self.chat(system, user, **kwargs)
         return self._safe_json(raw)
+
+    @staticmethod
+    def _json_mode_unsupported(exc: Exception) -> bool:
+        """True when the failure looks like "this provider has no json_object".
+
+        Deliberately narrow: a transient network error must NOT be mistaken for
+        a capability gap, otherwise we would silently downgrade for the rest of
+        the process.
+        """
+        text = str(exc).lower()
+        mentions_param = "response_format" in text or "json_object" in text
+        mentions_rejection = any(
+            word in text
+            for word in (
+                "unsupported",
+                "not supported",
+                "unrecognized",
+                "unknown",
+                "invalid",
+                "unexpected",
+            )
+        )
+        return mentions_param and mentions_rejection
+
+    def _extract_json(self, system: str, user: str) -> dict:
+        """Structured-extraction call, reasoning chain disabled.
+
+        抽取是**确定性变换**（文本 → 固定 schema 的 JSON），模型的思考链
+        在这里不产生任何价值，却把延迟从秒级推到分钟级（见 ``_NO_THINKING``）。
+        因此抽取类调用一律走这里，匹配 / 评分这类需要判断的调用仍用
+        :meth:`chat_json`，保留推理。
+
+        非 Qwen 提供方不认识 ``enable_thinking``，会以 400 拒绝。这里沿用
+        [chat_json] 的同一套「探测一次、记住结果」策略：首次被拒后就不再传，
+        避免每次调用都付一次注定失败的 400。
+        """
+        if self._no_thinking is not False:
+            try:
+                result = self.chat_json(system, user, extra_body=_NO_THINKING)
+                self._no_thinking = True
+                return result
+            except Exception as exc:
+                if not self._thinking_unsupported(exc):
+                    raise
+                logger.warning(
+                    "Provider rejected enable_thinking, falling back to "
+                    "reasoning-enabled extraction: %s",
+                    exc,
+                )
+                self._no_thinking = False
+
+        return self.chat_json(system, user)
+
+    @staticmethod
+    def _thinking_unsupported(exc: Exception) -> bool:
+        """True when the failure looks like "no such argument: enable_thinking".
+
+        Kept narrow on purpose: a timeout or network error must NOT be read as
+        a capability gap, or we would silently lose the speedup for the whole
+        process.
+        """
+        text = str(exc).lower()
+        return "enable_thinking" in text
 
     # ── Domain-specific helpers ───────────────────────────────────────────
 
@@ -234,8 +405,12 @@ class LLMService:
         return self.chat_json(JOB_PARSE_PROMPT, description)
 
     def parse_resume(self, resume_text: str) -> dict:
-        """Extract structured skill graph from resume text."""
-        return self.chat_json(RESUME_PARSE_PROMPT, resume_text)
+        """Extract structured skill graph from resume text.
+
+        Runs through :meth:`_extract_json` (reasoning chain disabled) —
+        see ``_NO_THINKING`` for the measured latency impact.
+        """
+        return self._extract_json(RESUME_PARSE_PROMPT, resume_text)
 
     def match(
         self,
@@ -308,58 +483,140 @@ class LLMService:
     # ── Internals ─────────────────────────────────────────────────────────
 
     @staticmethod
-    def _safe_json(text: str) -> dict:
-        """Extract and parse JSON from LLM output (handles markdown fences)."""
-        # Strip markdown code fences
+    def _strip_fence(text: str) -> str:
+        """Drop a surrounding ``` / ```json markdown fence."""
         text = text.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[-1]
             text = text.rsplit("```", 1)[0]
-        text = text.strip()
+        return text.strip()
 
+    @staticmethod
+    def _escape_stray_quotes(text: str) -> str:
+        """Escape unescaped double quotes sitting inside a JSON string value.
+
+        The model copies quotes straight out of the source text, e.g.
+
+            "highlights": ["晋级第五届“互联网+"大学生创新创业大赛"]
+
+        The half-width quote after ``+`` closes the string early, so the rest
+        becomes an illegal token and ``json.loads`` raises
+        ``Expecting ',' delimiter`` — which used to collapse a whole resume
+        into an empty profile.
+
+        Telling a value's closing quote from a stray one inside it: a closing
+        quote can only be followed by ``,`` ``}`` ``]`` ``:`` (or end of text),
+        ignoring whitespace. Anything else means the quote was content, so we
+        backslash it and stay inside the string.
+        """
+        out: list[str] = []
+        in_string = False
+        escaped = False
+        index = 0
+        length = len(text)
+
+        while index < length:
+            char = text[index]
+
+            if not in_string:
+                out.append(char)
+                if char == '"':
+                    in_string = True
+                    escaped = False
+                index += 1
+                continue
+
+            if escaped:  # previous char was a backslash: take this one verbatim
+                out.append(char)
+                escaped = False
+            elif char == "\\":
+                out.append(char)
+                escaped = True
+            elif char == '"':
+                lookahead = index + 1
+                while lookahead < length and text[lookahead] in " \t\r\n":
+                    lookahead += 1
+                following = text[lookahead] if lookahead < length else ""
+                # `following == ""` at end of text is `in` the set, i.e. a closer.
+                if following in ',}]:':
+                    out.append(char)
+                    in_string = False
+                else:
+                    out.append('\\"')
+            else:
+                out.append(char)
+            index += 1
+
+        return "".join(out)
+
+    @staticmethod
+    def _loads(text: str) -> Any:
+        """Parse text as JSON, or None if it isn't JSON."""
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            logger.warning("LLM output is not valid JSON, attempting repair...")
-            # Try to find { ... } block
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1:
-                try:
-                    return json.loads(text[start : end + 1])
-                except json.JSONDecodeError:
-                    pass
-            logger.error("Failed to parse LLM output as JSON: %s", text[:300])
-            return {}
+            return None
 
-    @staticmethod
-    def _safe_json_array(text: str) -> list[dict]:
-        """Extract and parse a JSON array from LLM output."""
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1]
-            text = text.rsplit("```", 1)[0]
-        text = text.strip()
+    @classmethod
+    def _json_candidates(
+        cls, text: str, open_char: str, close_char: str
+    ) -> list[tuple[str, str]]:
+        """Parse candidates ordered cheapest-first, each labelled with how it was derived.
 
-        try:
-            result = json.loads(text)
-            if isinstance(result, list):
+        The order *is* the repair strategy: every candidate is only reached
+        after the previous one failed, so the least destructive transformation
+        that can possibly work is always tried first.
+        """
+        stripped = cls._strip_fence(text)
+        start = stripped.find(open_char)
+        end = stripped.rfind(close_char)
+        sliced = (
+            stripped[start : end + 1] if start != -1 and end != -1 else stripped
+        )
+
+        candidates = [(stripped, "raw")]
+        if sliced != stripped:
+            candidates.append((sliced, "sliced"))
+        repaired = cls._escape_stray_quotes(sliced)
+        if repaired != sliced:
+            candidates.append((repaired, "escaped_stray_quotes"))
+        return candidates
+
+    @classmethod
+    def _safe_json(cls, text: str) -> dict:
+        """Extract and parse a JSON object from LLM output.
+
+        Tolerates markdown fences, surrounding prose, and unescaped quotes
+        inside string values.
+        """
+        for candidate, how in cls._json_candidates(text, "{", "}"):
+            result = cls._loads(candidate)
+            if isinstance(result, dict):
+                if how == "escaped_stray_quotes":
+                    logger.warning(
+                        "LLM output had unescaped quotes inside string values; "
+                        "repaired before parsing."
+                    )
                 return result
-            # Sometimes LLM wraps array in an object
+        logger.error("Failed to parse LLM output as JSON: %s", text[:300])
+        return {}
+
+    @classmethod
+    def _safe_json_array(cls, text: str) -> list[dict]:
+        """Extract and parse a JSON array from LLM output."""
+        for candidate, how in cls._json_candidates(text, "[", "]"):
+            result = cls._loads(candidate)
+            if isinstance(result, list):
+                if how == "escaped_stray_quotes":
+                    logger.warning(
+                        "LLM output had unescaped quotes inside string values; "
+                        "repaired before parsing."
+                    )
+                return result
+            # Sometimes the model wraps the array in an object.
             if isinstance(result, dict):
                 for key in ("results", "matches", "data", "items"):
-                    if key in result and isinstance(result[key], list):
+                    if isinstance(result.get(key), list):
                         return result[key]
-            return []
-        except json.JSONDecodeError:
-            logger.warning("LLM output is not valid JSON array, attempting repair...")
-            start = text.find("[")
-            end = text.rfind("]")
-            if start != -1 and end != -1:
-                try:
-                    result = json.loads(text[start : end + 1])
-                    return result if isinstance(result, list) else []
-                except json.JSONDecodeError:
-                    pass
-            logger.error("Failed to parse LLM output as JSON array: %s", text[:300])
-            return []
+        logger.error("Failed to parse LLM output as JSON array: %s", text[:300])
+        return []

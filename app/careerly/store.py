@@ -125,12 +125,52 @@ class CareerlyStore:
                 PRIMARY KEY (result_id, job_id)
             );
 
+            -- 「当前简历」——**只有一份**，是分析链路读的那份基线。
+            -- ⚠️ 它同时是 careerly_resume_versions 里 is_current=1 那条的
+            -- 冗余副本，写入方必须两边一起改（见 save_resume / add_resume_version）。
+            -- 之所以不取消这张表：POST /analysis 直接读它，
+            -- 保留就能让分析链路一行都不用改。
             CREATE TABLE IF NOT EXISTS careerly_resumes (
                 user_id    INTEGER PRIMARY KEY,
                 text       TEXT NOT NULL DEFAULT '',
                 profile    TEXT,
                 updated_at REAL NOT NULL
             );
+
+            -- 简历版本 —— PRD §14 / Figma `ResumeHistoryPage`：
+            -- 「支持当前简历 / 历史简历 / 上传新简历 / 删除 / 设置当前简历」。
+            --
+            -- ⚠️ 每次 `POST /resume` 是**追加**一行，不是覆盖 —— 这正是
+            -- 「上传新简历后历史列表里多出一张卡」的数据来源。
+            -- 覆盖式写入（旧实现）会让「多版本」在数据层根本不可能存在。
+            --
+            -- `seq` 用来派生 label（`V{seq}`），取值 = 该用户当前存活的
+            -- **最大序号 + 1**。
+            --
+            -- 为什么存列、不按行序现算：**已存在的版本号永远不变**。
+            -- 按行序现算的话，删掉 V2 会让 V3 突然显示成 V2 ——
+            -- 用户看到的版本号会自己跳，Figma 的 onDelete 也只是过滤列表，
+            -- 不会重排剩下的版本号。
+            --
+            -- ⚠️ 已知的、**可达的**边界：删掉序号最大的那个版本（先把某个
+            -- 小号版本「设为当前」，最大的就成了可删的归档版本）之后，
+            -- 下一次上传会复用那个号 —— 列表本身仍然自洽（旧的那条已经没了），
+            -- 只是同一版号在不同时间指过不同的简历。
+            -- 要彻底消除，得引入永不回退的用户级计数器或软删除；
+            -- 两者都会让「读列表」多一个必须记住的过滤条件，代价大于收益。
+            CREATE TABLE IF NOT EXISTS careerly_resume_versions (
+                id         TEXT PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                seq        INTEGER NOT NULL,
+                text       TEXT NOT NULL DEFAULT '',
+                profile    TEXT,
+                file_name  TEXT,
+                created_at REAL NOT NULL,
+                is_current INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_careerly_resume_versions_user
+                ON careerly_resume_versions (user_id, seq DESC);
 
             CREATE TABLE IF NOT EXISTS user_quota (
                 user_id   INTEGER PRIMARY KEY,
@@ -334,14 +374,40 @@ class CareerlyStore:
             for r in rows
         ]
 
-    # ── Resume baseline ─────────────────────────────────────────────────
+    # ── Resume: current baseline + versions ─────────────────────────────
+    #
+    # 两张表的关系（写这段前先读一遍，否则很容易只改一边）：
+    #
+    #   careerly_resumes          当前简历，**一份**。分析链路（POST /analysis）
+    #                             直接读它，所以它必须永远等于「当前版本」。
+    #   careerly_resume_versions  全部版本，**每次上传追加一行**。
+    #
+    # 不变式：is_current=1 的那一行，其 text / profile 与 careerly_resumes 相同。
+    # 下面每个写方法都同时维护两边 —— 这是**故意**的冗余：
+    # 换来的是一行都不改的分析链路。
 
     def save_resume(self, user_id: int, text: str, profile: dict | None = None) -> None:
+        """刷新**当前版本**的文本 / 画像 —— 不产生新版本。
+
+        调用方是 ``POST /analysis``（分析链路顺带重解析）与 ``PUT /resume``
+        （只改基线文本）。两者语义都是「把当前这份简历更新一下」，
+        而不是「用户又交了一份新简历」—— 后者走 [add_resume_version]。
+
+        ⚠️ 若该用户此前只有旧的单基线数据，这里会顺带把版本表回填出来，
+        否则「当前版本」会变成一条查不到的孤儿记录。
+        """
         conn = _get_conn(self.db_path)
+        now = time.time()
         conn.execute(
             "INSERT OR REPLACE INTO careerly_resumes (user_id, text, profile, updated_at) "
             "VALUES (?, ?, ?, ?)",
-            (user_id, text, _j(profile or {}), time.time()),
+            (user_id, text, _j(profile or {}), now),
+        )
+        self._ensure_resume_versions(user_id)
+        conn.execute(
+            "UPDATE careerly_resume_versions SET text = ?, profile = ? "
+            "WHERE user_id = ? AND is_current = 1",
+            (text, _j(profile or {}), user_id),
         )
         conn.commit()
 
@@ -357,6 +423,163 @@ class CareerlyStore:
             "profile": _unjson(row["profile"], {}),
             "updatedAt": iso(row["updated_at"]),
         }
+
+    # ── Resume versions ─────────────────────────────────────────────────
+
+    def _ensure_resume_versions(self, user_id: int) -> None:
+        """把「只有单基线」的历史用户回填成第一条版本记录。
+
+        幂等：版本表里已经有该用户的行就什么也不做。
+        没有这一步，多版本功能上线前注册的用户打开「我的简历」
+        会看到空列表 —— 而他们的简历明明还在 careerly_resumes 里。
+        """
+        conn = _get_conn(self.db_path)
+        exists = conn.execute(
+            "SELECT 1 FROM careerly_resume_versions WHERE user_id = ? LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        if exists is not None:
+            return
+        base = conn.execute(
+            "SELECT * FROM careerly_resumes WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if base is None:
+            return
+        conn.execute(
+            "INSERT INTO careerly_resume_versions "
+            "(id, user_id, seq, text, profile, file_name, created_at, is_current) "
+            "VALUES (?, ?, 1, ?, ?, NULL, ?, 1)",
+            (uuid.uuid4().hex, user_id, base["text"],
+             base["profile"] or "{}", base["updated_at"]),
+        )
+        conn.commit()
+
+    @staticmethod
+    def _version_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            # label 由 seq 派生而不是存列 —— 只有一处能产生版号，
+            # 不会出现「列里的 label 和 seq 对不上」这种漂移。
+            "label": f"V{row['seq']}",
+            "fileName": row["file_name"],
+            "uploadedAt": iso(row["created_at"]),
+            "isCurrent": bool(row["is_current"]),
+        }
+
+    def list_resume_versions(self, user_id: int) -> list[dict[str, Any]]:
+        """全部版本，当前版本排第一，其余按版号倒序（新的在前）。"""
+        self._ensure_resume_versions(user_id)
+        conn = _get_conn(self.db_path)
+        rows = conn.execute(
+            "SELECT * FROM careerly_resume_versions WHERE user_id = ? "
+            "ORDER BY is_current DESC, seq DESC",
+            (user_id,),
+        ).fetchall()
+        return [self._version_row(r) for r in rows]
+
+    def add_resume_version(
+        self,
+        user_id: int,
+        text: str,
+        profile: dict | None = None,
+        file_name: str | None = None,
+    ) -> dict[str, Any]:
+        """追加一份新简历版本，并把它设为当前简历。
+
+        这是 `POST /resume` 的落库路径 —— 「上传新简历」在数据层
+        就是**多一行**，历史版本列表随之多出一张卡。
+        """
+        self._ensure_resume_versions(user_id)
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS m FROM careerly_resume_versions "
+            "WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        seq = int(row["m"]) + 1
+        version_id = uuid.uuid4().hex
+        now = time.time()
+
+        conn.execute(
+            "UPDATE careerly_resume_versions SET is_current = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.execute(
+            "INSERT INTO careerly_resume_versions "
+            "(id, user_id, seq, text, profile, file_name, created_at, is_current) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
+            (version_id, user_id, seq, text, _j(profile or {}), file_name, now),
+        )
+        # 同步「当前简历」基线 —— 不变式见本区块顶部说明。
+        conn.execute(
+            "INSERT OR REPLACE INTO careerly_resumes (user_id, text, profile, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, text, _j(profile or {}), now),
+        )
+        conn.commit()
+        return next(
+            v for v in self.list_resume_versions(user_id) if v["id"] == version_id
+        )
+
+    def set_current_resume_version(self, user_id: int, version_id: str) -> bool:
+        """把某个历史版本提为当前简历。找不到该版本时返回 `False`。"""
+        self._ensure_resume_versions(user_id)
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT * FROM careerly_resume_versions WHERE user_id = ? AND id = ?",
+            (user_id, version_id),
+        ).fetchone()
+        if row is None:
+            return False
+
+        conn.execute(
+            "UPDATE careerly_resume_versions SET is_current = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.execute(
+            "UPDATE careerly_resume_versions SET is_current = 1 WHERE id = ?",
+            (version_id,),
+        )
+        # `updated_at` 取该版本自己的创建时间，**不是** now()。
+        # 「更新于」说的是「这份简历是什么时候的」，把切换动作的时刻写进去
+        # 会让一份 5 月的简历显示成今天更新的。
+        conn.execute(
+            "INSERT OR REPLACE INTO careerly_resumes (user_id, text, profile, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, row["text"], row["profile"] or "{}", row["created_at"]),
+        )
+        conn.commit()
+        return True
+
+    def delete_resume_version(self, user_id: int, version_id: str) -> str:
+        """删除一个历史版本。
+
+        返回 ``"ok"`` / ``"not_found"`` / ``"current"`` —— 用字符串而不是
+        抛异常，是因为这三种结果需要映射成**不同**的 HTTP 语义
+        （204 / 404 / 409），异常类型在这里反而不好分。
+
+        ⚠️ **当前简历不可删**。Figma 的删除按钮只出现在历史版本卡上
+        （`SwipeableResumeCard` 一律带「归档」胶囊），当前简历一旦删掉，
+        `careerly_resumes` 就没有来源了 —— 分析链路会直接断。
+        """
+        self._ensure_resume_versions(user_id)
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT is_current FROM careerly_resume_versions "
+            "WHERE user_id = ? AND id = ?",
+            (user_id, version_id),
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        if row["is_current"]:
+            return "current"
+
+        conn.execute(
+            "DELETE FROM careerly_resume_versions WHERE user_id = ? AND id = ?",
+            (user_id, version_id),
+        )
+        conn.commit()
+        return "ok"
 
     # ── Quota ───────────────────────────────────────────────────────────
 

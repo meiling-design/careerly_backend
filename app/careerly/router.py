@@ -12,9 +12,12 @@ Endpoints (all require a JWT via ``get_current_user``):
     GET  /api/v1/analysis/tasks              list own analysis tasks (P1-1a 可观测)
     GET  /api/v1/analysis/tasks/{tid}        one task (ownership-scoped)
     POST /api/v1/resume                      submit a resume asset (file/image/text)
-                                             → parse → establish Career Baseline
+                                             → parse → **append a new version**
+                                             → make it the current baseline
     PUT  /api/v1/resume                      save resume baseline text (P3 preview)
-    GET  /api/v1/resume                      read resume baseline
+    GET  /api/v1/resume                      current resume + all versions
+    PUT  /api/v1/resume/versions/{vid}/current   promote a version (PRD §14)
+    DELETE /api/v1/resume/versions/{vid}         delete an archived version
     GET  /api/v1/quota                       QuotaState (Baseline §5: free 3)
     POST /api/v1/ai/messages                 AI advisor — SSE streaming (P-AI-1)
     GET  /api/v1/growth/events               growth footprint events (P2-4)
@@ -299,9 +302,12 @@ async def create_resume_asset(
     # ── 1. 取文本：文件与粘贴文本在这里合流 ────────────────────────────
     cleanup: tempfile.TemporaryDirectory | None = None
     agent = ResumeAgent()
+    #: 原始文件名，记进版本卡（[ResumeVersion.fileName]）。粘贴文本时为 None。
+    source_name: str | None = None
 
     try:
         if file is not None and file.filename:
+            source_name = file.filename
             suffix = Path(file.filename).suffix.lower()
             if suffix not in _ALLOWED_RESUME_SUFFIXES:
                 return err(
@@ -351,35 +357,46 @@ async def create_resume_asset(
         profile.model_dump() if hasattr(profile, "model_dump") else {}
     )
 
-    # ── 2. 落库：text 是权威，profile 是它的派生缓存 ────────────────────
+    # ── 2. 落库：**追加一个新版本**（PRD §14 / Figma `ResumeHistoryPage`）──
     #
-    # ⚠️ **只在画像「有结构」时覆盖已有 profile** —— 沿用 `POST /analysis`
+    # ⚠️ 这里是 `add_resume_version` 而不是 `save_resume` —— 两者差别是
+    # 整个多版本功能的支点：
+    #   add_resume_version   用户又交了一份新简历 → 版本表**多一行**
+    #   save_resume          当前这份简历被刷新 → 原地改，不动版本表
+    # 用错就会退回「上传后覆盖旧的、历史列表永远只有一张卡」的老行为。
+    #
+    # ⚠️ **只在画像「有结构」时采用新 profile** —— 沿用 `POST /analysis`
     # 同一条纪律（见该处注释）：解析偶尔会降级成只有 raw_text 的空壳，
-    # 用空壳覆盖已有画像会让「我的 → 职业资产」突然清零。
-    existing = store.get_resume(user_id) or {}
+    # 用空壳当画像会让「我的 → 职业资产」突然清零。
+    # 但**版本照样要记** —— 用户确实交了这份简历，历史里该有它。
+    previous = store.get_resume(user_id) or {}
     structured = any(
         profile_dump.get(key)
         for key in ("skills", "roles", "projects", "education", "certifications")
     )
-
-    if structured:
-        store.save_resume(user_id, resume_text, profile_dump)
-    else:
+    if not structured:
         logger.warning(
             "Careerly resume asset produced no structured profile | user=%d "
             "| keeping previous profile", user_id,
         )
-        store.save_resume(user_id, resume_text, existing.get("profile") or {})
 
+    version = store.add_resume_version(
+        user_id,
+        resume_text,
+        profile_dump if structured else (previous.get("profile") or {}),
+        file_name=source_name,
+    )
     saved = store.get_resume(user_id) or {}
     logger.info(
-        "Careerly resume asset saved | user=%d | chars=%d | structured=%s",
-        user_id, len(resume_text), structured,
+        "Careerly resume asset saved | user=%d | chars=%d | structured=%s | version=%s",
+        user_id, len(resume_text), structured, version.get("label"),
     )
     return ok({
         "text": saved.get("text", resume_text),
         "profile": saved.get("profile", {}),
         "updatedAt": saved.get("updatedAt"),
+        "version": version,
+        "versions": store.list_resume_versions(user_id),
     })
 
 
@@ -420,10 +437,58 @@ async def save_resume(
 
 @router.get("/resume")
 async def get_resume(current_user: dict = Depends(get_current_user)):
-    saved = get_store().get_resume(int(current_user["id"]))
+    """当前简历（文本 + 画像）+ **全部版本**。
+
+    ``versions`` 是「我的简历」列表的数据来源：``isCurrent`` 那条进顶部
+    横幅，其余进「历史版本 · 左滑操作」。此前这个端点只返回一份基线，
+    Flutter 侧只能**合成**一个假版本（``id: 'current'``）——
+    于是「上传新简历」在界面上永远长不出第二张卡。
+    """
+    store = get_store()
+    user_id = int(current_user["id"])
+    saved = store.get_resume(user_id)
     if saved is None:
         return ok(None)  # no baseline yet — Dart treats null as "hasBaseline=false"
-    return ok(saved)
+    return ok({**saved, "versions": store.list_resume_versions(user_id)})
+
+
+@router.put("/resume/versions/{version_id}/current")
+async def set_current_resume_version(
+    version_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """把某个历史版本设为当前简历（PRD §14）。
+
+    ⚠️ 会**同时改写分析用的基线**（``careerly_resumes``）—— 这正是
+    「换了当前简历，下次分析用的是新的那份」的落点。
+    """
+    store = get_store()
+    user_id = int(current_user["id"])
+    if not store.set_current_resume_version(user_id, version_id):
+        return err("NOT_FOUND", "指定的简历版本不存在", 404)
+    return ok({"versions": store.list_resume_versions(user_id)})
+
+
+@router.delete("/resume/versions/{version_id}")
+async def delete_resume_version(
+    version_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """删除一个**历史**版本（PRD §14）。
+
+    ``409`` 表示该版本是当前简历 —— **当前简历不可删**。
+    Figma 的删除按钮只出现在带「归档」胶囊的历史卡上（`SwipeableResumeCard`），
+    而且删掉当前简历会让分析链路失去基线来源。用户在界面上也走不到这条路径，
+    这里拒绝是为了让「数据层自己站得住」，不是靠 UI 拦着。
+    """
+    store = get_store()
+    user_id = int(current_user["id"])
+    result = store.delete_resume_version(user_id, version_id)
+    if result == "not_found":
+        return err("NOT_FOUND", "指定的简历版本不存在", 404)
+    if result == "current":
+        return err("VALIDATION_ERROR", "当前简历不能删除，请先设为其他版本", 409)
+    return ok({"versions": store.list_resume_versions(user_id)})
 
 
 # ── Quota ──────────────────────────────────────────────────────────────────

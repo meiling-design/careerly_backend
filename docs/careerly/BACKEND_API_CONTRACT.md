@@ -34,31 +34,40 @@
 
 ### 0.5.1 已落地且已对接（Flutter → 真实后端）
 
-以下 5 个端点构成当前 MVP 的完整闭环：**登录 → 存简历 → 分析 → 读结果 → 查额度**。
+以下端点构成当前 MVP 的完整闭环：**登录 → 存简历（提交即解析）→ 分析 → 读结果 → 查额度**。
 
 | Flutter 侧 | 方法与路径 | 鉴权 | 备注 |
 |---|---|---|---|
 | `AuthRepository.register` | `POST /api/v1/auth/register` | — | `AUTH_MODE=dev` 下手机号直登，无需验证码 |
 | `AuthRepository.login` | `POST /api/v1/auth/login` | — | 同上 |
-| `ResumeRepository.submitResumeText` | `PUT /api/v1/resume` | JWT | 存简历基线 |
+| `ResumeRepository.submitResumeText` | `POST /api/v1/resume`（multipart `text`） | JWT | **提交即解析**（ResumeAgent），返回 `{text, profile, updatedAt}` |
+| `ResumeRepository.submitResumeFile` | `POST /api/v1/resume`（multipart `file`） | JWT | 同上；PDF / DOCX / TXT / 图片（OCR） |
 | `ResumeRepository.fetchProfile` | `GET /api/v1/resume` | JWT | 无基线时返回 `null` |
 | `AnalysisRepository.analyze` | `POST /api/v1/analysis` | JWT | **同步**跑完 LangGraph 8 节点后返回（10–210s） |
+| `AnalysisRepository.parseJobUrl` | `POST /api/v1/analysis/jobs/parse-url` | JWT | P4-3；不扣额度、不建任务 |
 | `AnalysisRepository.fetchProjects` | `GET /api/v1/analysis/projects` | JWT | |
 | `AnalysisRepository.fetchProject` | `GET /api/v1/analysis/projects/{id}` | JWT | 越权 → 404 |
 | `AnalysisRepository.fetchJobLibrary` | `GET /api/v1/analysis/jobs` | JWT | |
 | `AnalysisRepository.fetchQuota` | `GET /api/v1/quota` | JWT | ⚠️ 路径与 §1 草案不同，见 §0.5.5 |
+| `AIRepository.sendMessage` | `POST /api/v1/ai/messages` | JWT | **SSE 流**，详见 **§0.5.8**（2026-10-04 由 §0.5.2 移入） |
 
 > 另有 `POST /api/v1/auth/refresh`（刷新令牌）与 `GET /api/v1/auth/me`，由 `ApiClient`
 > 在 401 时自动调用，Flutter Repository 层不直接感知。
 
 ### 0.5.2 已存在但 Flutter 未对接（仍走 Mock）
 
+> ⚠️ **2026-10-04 更正**：本节原把 `POST /api/v1/ai/messages` 也列在这里，
+> 但 Flutter 侧 `ApiAiRepository` 已落地并已在 `providers.dart` 绑定
+> （`useApi ? ApiAiRepository(client) : MockAIRepository()`）—— **该行已不成立**，
+> 移入 §0.5.1。同时 `POST /api/v1/resume/upload` 的「排 P3」理由已失效
+> （P4-2 已用统一入口 `POST /api/v1/resume` 收掉文件上传，见 §0.5.3 与
+> `app/careerly/router.py` 的端点分工表）。
+
 | 方法与路径 | 状态 | 卡在哪 |
 |---|---|---|
 | `GET /api/v1/analysis/tasks` | ✅ 已建（P1-1a） | Flutter 未接；等 P1-1b 定「要不要轮询」 |
 | `GET /api/v1/analysis/tasks/{id}` | ✅ 已建（P1-1a） | 同上 |
-| `POST /api/v1/resume/upload` | ✅ 已建（multipart） | **Flutter 明确不接**：单版本基线用文本即可，文件上传排 P3 |
-| `POST /api/v1/ai/messages` | ✅ 已建（P-AI-1, 2026-10-03） | 曾因「AI 能力边界未定」暂缓（P3-4）。边界已于 2026-10-03 裁决并实现，完整契约见 **§0.5.8** |
+| `POST /api/v1/resume/upload` | ✅ 已建（multipart） | **已被取代，勿再新增调用**：统一入口是 `POST /api/v1/resume`（文件 / 图片 / 文本三合一）。旧端点只收 pdf/docx/txt，与 Flutter 白名单不一致 —— 属历史包袱 |
 
 ### 0.5.3 P3 新增：已落地且已对接（2026-10-02 回写）
 

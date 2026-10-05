@@ -4,7 +4,11 @@
 Supports:
   CLI:     python main.py --urls URL1 URL2 --resume path/to/resume.pdf
   UI:      streamlit run app/ui/streamlit_app.py
-  API:     uvicorn main:app  (FastAPI, not yet implemented)
+  API:     uvicorn app.api.server:app --host 0.0.0.0 --port 8000
+
+⚠️ 本文件是 **CLI 入口**，不是 API 入口 —— 它没有 `app` 对象，
+`uvicorn main:app` 会直接导入失败。FastAPI 应用在 ``app/api/server.py``
+（Careerly 契约面全部挂在 ``/api/v1``，见 ``app/careerly/router.py``）。
 """
 
 from __future__ import annotations

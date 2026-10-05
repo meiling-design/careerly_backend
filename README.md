@@ -249,6 +249,7 @@ curl -X POST http://localhost:8000/match \
 ### 决策流程
 
 ```
+
 数据质量信号 → LLM Router → 置信度≥0.6? → 是 → LLM决策
                                         → 否 → 规则回退
 ```

@@ -47,3 +47,7 @@ data/*.db
 tests/.tmp_p1/
 tests/.tmp_engine/
 .pytest_tmp/
+
+# 本地联调产物 —— 接口响应转储 / 真机截图，只在本机有意义
+/proj.json
+/*.png

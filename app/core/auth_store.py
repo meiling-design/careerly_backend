@@ -2,12 +2,28 @@
 
 Identity model
 --------------
-Careerly's account identity is the **phone number** (产品裁决 D85:
-``register(name, phone, email?)`` / ``login(phone)`` -- no password and no
-verification code). The store therefore no longer requires credentials.
+Careerly's account identity is the **phone number**; the credential is an
+**optional password**.
 
-``password_hash`` is kept as a **nullable** column, reserved for a possible
-future D85 revisit; nothing writes to it today.
+```text
+2026-10-04 之前   身份 = 手机号，无密码（产品裁决 D85）—— 手机号即凭据
+2026-10-04 起     身份 = 手机号，密码作为可选凭据（新 Figma 设计带来）
+```
+
+``password_hash`` 因此有两种合法取值：
+
+```text
+非 NULL   走密码校验的账号（新注册流程创建）
+NULL      遗留 / DEV 账号 —— 仍按 D85 的「手机号直登」处理，
+          且仍受 ``app.core.auth_mode.is_dev_auth()`` 门禁
+```
+
+本层只负责**存取**哈希字符串，不做任何哈希 / 校验运算
+（那是 ``app.core.passwords`` 的职责）。
+
+⚠️ ``_row_to_user()`` **永远不得**返回 ``password_hash`` ——
+它产出的 dict 会直接进入响应体与 ``get_current_user`` 依赖。
+需要哈希的调用方走 :meth:`AuthStore.get_password_hash`。
 
 Storage
 -------
@@ -144,18 +160,35 @@ class AuthStore:
 
     # ── Create ───────────────────────────────────────────────────────────
 
-    def create_user(self, phone: str, name: str = "", email: str | None = None) -> int:
-        """Insert a new user; return the new auto-increment id."""
+    def create_user(
+        self,
+        phone: str,
+        name: str = "",
+        email: str | None = None,
+        password_hash: str | None = None,
+    ) -> int:
+        """Insert a new user; return the new auto-increment id.
+
+        [password_hash] 为空表示这是一个**无密码账号**（遗留 / DEV 形态）——
+        见模块文档的身份模型说明。哈希由调用方（``app.core.passwords``）算好，
+        本层不接触明文。
+        """
         now = time.time()
         conn = _get_conn(self.db_path)
         cur = conn.execute(
-            "INSERT INTO users (phone, name, email, is_active, created_at, updated_at) "
-            "VALUES (?, ?, ?, 1, ?, ?)",
-            (phone, name, email, now, now),
+            "INSERT INTO users "
+            "(phone, name, email, password_hash, is_active, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?)",
+            (phone, name, email, password_hash, now, now),
         )
         conn.commit()
         user_id = int(cur.lastrowid)
-        logger.info("AuthStore: user created | id=%d | phone=%s", user_id, phone)
+        logger.info(
+            "AuthStore: user created | id=%d | phone=%s | has_password=%s",
+            user_id,
+            phone,
+            password_hash is not None,
+        )
         return user_id
 
     # ── Reads ────────────────────────────────────────────────────────────
@@ -187,6 +220,20 @@ class AuthStore:
         conn = _get_conn(self.db_path)
         row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
         return self._row_to_user(row) if row else None
+
+    def get_password_hash(self, user_id: int) -> str | None:
+        """Return the stored bcrypt hash, or ``None`` for a passwordless account.
+
+        ⚠️ 单独开一个读口，而不是让它混进 :meth:`_row_to_user` ——
+        后者的产物会进响应体（见模块文档的约束说明）。
+        """
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT password_hash FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return row["password_hash"]
 
     # ── Uniqueness checks ───────────────────────────────────────────────
 

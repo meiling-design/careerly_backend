@@ -29,12 +29,39 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
+from app.core.auth_mode import is_production
+from app.core.config_guard import InsecureSecretConfiguration
 from app.utils.logger import logger
 
 # ── Secrets & token configuration ─────────────────────────────────────────
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-insecure-change-me")
-if SECRET_KEY == "dev-insecure-change-me":
+_DEV_INSECURE_SECRET = "dev-insecure-change-me"
+# HS256 的密钥空间就是它的熵。32 字符是下限而非目标 ——
+# 用 `python -c "import secrets;print(secrets.token_urlsafe(48))"` 生成。
+_MIN_SECRET_LENGTH = 32
+
+# 异常类型定义在 config_guard（**不参与重载**的模块），原因见该模块文档：
+# 定义在被 reload 的模块里会让类型身份每次重载都变，except 静默失配。
+
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", _DEV_INSECURE_SECRET)
+
+# 与 auth_mode.assert_auth_configuration_is_safe() 同样是**导入期**硬阻断。
+# 这里刻意从 warning 升级为 raise：默认密钥意味着任何人都能伪造任意用户的
+# token —— 那不是「配置欠佳」，是**服务等价于没有认证**。
+# 告警在生产里会被忽略，启动即失败是唯一拦得住的机制。
+if is_production() and (
+    SECRET_KEY == _DEV_INSECURE_SECRET or len(SECRET_KEY) < _MIN_SECRET_LENGTH
+):
+    raise InsecureSecretConfiguration(
+        "拒绝启动：ENV=production 但 JWT_SECRET_KEY 缺失、仍为默认值、或短于 "
+        f"{_MIN_SECRET_LENGTH} 字符。\n"
+        "  该密钥用于签发所有用户的 access / refresh token。使用默认值等于"
+        "任何人皆可伪造任意账号的凭证。\n"
+        "  生产环境必须设置一个长随机值，例如：\n"
+        '    python -c "import secrets;print(secrets.token_urlsafe(48))"\n'
+        "  然后写入部署环境变量 JWT_SECRET_KEY。"
+    )
+elif SECRET_KEY == _DEV_INSECURE_SECRET:
     logger.warning(
         "JWT_SECRET_KEY not set — using insecure dev default. "
         "Set JWT_SECRET_KEY in production to a long random string."
@@ -93,26 +120,56 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 # ── Token creation ────────────────────────────────────────────────────────
 
-def _create_token(subject: str, token_type: str, expires_delta: timedelta) -> str:
-    """Build and sign a JWT for *subject* of the given *token_type*."""
+def _create_token(
+    subject: str,
+    token_type: str,
+    expires_delta: timedelta,
+    token_version: int = 0,
+) -> str:
+    """Build and sign a JWT for *subject* of the given *token_type*.
+
+    ``token_version``（发布基线 / 决策 D119）
+    ----------------------------------------
+    这是**吊销位**。JWT 天生无状态：一旦签发，在 ``exp`` 之前谁都收不回来。
+    删除账号、改密、封号都需要「立刻失效」，而我们没有 —— 也不想维护 ——
+    一张吊销表（那会变成每次请求多一次查表 + 一张只增不减的表）。
+
+    改为在用户行上存一个整数，签发时**快照进 token**，校验时与数据库当前值
+    比对。注销账号即 ``token_version += 1``，所有旧 token 在下一次请求就失效。
+
+    默认 ``0`` 是给**存量 token** 留的：它们没有这个声明，校验侧用
+    ``.get("token_version", 0)`` 读，因此不会因为本次上线被集体登出；
+    而真正需要吊销时（用户删除账号）版本号一加，新旧 token 一起失效。
+    """
     now = datetime.now(timezone.utc)
     payload: dict[str, Any] = {
         "sub": subject,
         "type": token_type,
         "iat": now,
         "exp": now + expires_delta,
+        "token_version": token_version,
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
-def create_access_token(subject: str) -> str:
+def create_access_token(subject: str, token_version: int = 0) -> str:
     """Create a short-lived access token (used as the Bearer credential)."""
-    return _create_token(subject, _ACCESS_TYPE, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    return _create_token(
+        subject,
+        _ACCESS_TYPE,
+        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        token_version,
+    )
 
 
-def create_refresh_token(subject: str) -> str:
+def create_refresh_token(subject: str, token_version: int = 0) -> str:
     """Create a long-lived refresh token (used to mint new access tokens)."""
-    return _create_token(subject, _REFRESH_TYPE, timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS))
+    return _create_token(
+        subject,
+        _REFRESH_TYPE,
+        timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+        token_version,
+    )
 
 
 def decode_token(token: str) -> dict:
@@ -192,6 +249,25 @@ async def get_current_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Account is disabled",
         )
+
+    # 已注销账号（决策 D119）。软删除后密码仍然是有效的 —— 少了这一条，
+    # 用户在 App 里「删除账号」之后重新登录就能拿到新版本号的 token，
+    # 吊销随即被绕过。账号一旦标记 deleted 就不该再签出任何凭据。
+    if user.get("status") == "deleted":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account has been deleted",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 吊销比对（决策 D119）。用户行本来就在这里读出来了，增量成本 ≈ 0。
+    # 缺失声明按 0 处理 —— 见 _create_token 的说明（存量 token 不因上线被登出）。
+    if int(payload.get("token_version", 0)) != int(user.get("token_version", 0) or 0):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return user
 
 
@@ -204,9 +280,10 @@ def issue_tokens(user_dict: dict) -> dict:
     "expires_in": <seconds>}``.
     """
     subject = str(user_dict["id"])
+    token_version = int(user_dict.get("token_version", 0) or 0)
     return {
-        "access_token": create_access_token(subject),
-        "refresh_token": create_refresh_token(subject),
+        "access_token": create_access_token(subject, token_version),
+        "refresh_token": create_refresh_token(subject, token_version),
         "token_type": "bearer",
         "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     }

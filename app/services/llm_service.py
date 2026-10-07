@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from app.utils.logger import logger
+from app.utils.redact import structural_preview
 
 load_dotenv()
 
@@ -242,7 +243,11 @@ class LLMService:
         try:
             resp = self.client.chat.completions.create(**kwargs)
             text = resp.choices[0].message.content or ""
-            logger.debug("LLM response (%d chars): %s...", len(text), text[:100])
+            # ⚠️ 模型输出必须脱敏（TODO K21）：内容来自简历 / JD。
+            # 骨架保留了结构信息（围栏 / 截断 / 转义），够排查用。
+            logger.debug(
+                "LLM response (%d chars): %s", len(text), structural_preview(text, 100)
+            )
             return text
         except Exception as e:
             logger.error("LLM chat failed: %s", e)
@@ -598,7 +603,12 @@ class LLMService:
                         "repaired before parsing."
                     )
                 return result
-        logger.error("Failed to parse LLM output as JSON: %s", text[:300])
+        # ⚠️ ERROR 级且默认 INFO 下必输出 —— 此前直接把模型原文前 300 字符
+        # 写进日志，而那段文字来自简历 / JD（TODO K21）。
+        # 换成结构骨架后，"为什么解析失败"的全部判据仍然可见。
+        logger.error(
+            "Failed to parse LLM output as JSON: %s", structural_preview(text, 300)
+        )
         return {}
 
     @classmethod
@@ -618,5 +628,8 @@ class LLMService:
                 for key in ("results", "matches", "data", "items"):
                     if isinstance(result.get(key), list):
                         return result[key]
-        logger.error("Failed to parse LLM output as JSON array: %s", text[:300])
+        # ⚠️ 同 `_safe_json_object`：ERROR 级，生产必输出（TODO K21）。
+        logger.error(
+            "Failed to parse LLM output as JSON array: %s", structural_preview(text, 300)
+        )
         return []

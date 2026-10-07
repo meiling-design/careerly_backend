@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from app.utils.logger import logger
+from app.utils.redact import mask_phone
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DB_PATH = DATA_DIR / "auth.db"
@@ -82,6 +83,9 @@ class AuthStore:
                 email         TEXT UNIQUE,
                 password_hash TEXT,
                 is_active     INTEGER NOT NULL DEFAULT 1,
+                status        TEXT NOT NULL DEFAULT 'active',
+                token_version INTEGER NOT NULL DEFAULT 0,
+                deleted_at    REAL,
                 created_at    REAL NOT NULL,
                 updated_at    REAL NOT NULL
             );
@@ -100,6 +104,21 @@ class AuthStore:
             conn.execute("ALTER TABLE users ADD COLUMN phone TEXT")
         if "name" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+
+        # ── 发布基线新增（决策 D119）─────────────────────────────────────
+        # status / deleted_at  软删除：status='deleted' 后 30 天再物理清理
+        # token_version        吊销位：注销即 +1，让所有已签发 JWT 立刻失效
+        # DEFAULT 让存量行自动落到「正常、未吊销」，无需回填。
+        if "status" not in cols:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+            )
+        if "token_version" not in cols:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"
+            )
+        if "deleted_at" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN deleted_at REAL")
         # Cannot add UNIQUE via ALTER TABLE; a unique index is equivalent.
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)"
@@ -138,17 +157,24 @@ class AuthStore:
                 email         TEXT UNIQUE,
                 password_hash TEXT,
                 is_active     INTEGER NOT NULL DEFAULT 1,
+                status        TEXT NOT NULL DEFAULT 'active',
+                token_version INTEGER NOT NULL DEFAULT 0,
+                deleted_at    REAL,
                 created_at    REAL NOT NULL,
                 updated_at    REAL NOT NULL
             );
             INSERT INTO users_new
-                (id, phone, name, email, password_hash, is_active, created_at, updated_at)
+                (id, phone, name, email, password_hash, is_active,
+                 status, token_version, deleted_at, created_at, updated_at)
             SELECT id,
                    COALESCE(NULLIF(TRIM(COALESCE(phone, '')), ''), 'legacy_' || id),
                    COALESCE(name, ''),
                    email,
                    password_hash,
                    COALESCE(is_active, 1),
+                   'active',
+                   0,
+                   NULL,
                    created_at,
                    updated_at
             FROM users;
@@ -183,10 +209,11 @@ class AuthStore:
         )
         conn.commit()
         user_id = int(cur.lastrowid)
+        # ⚠️ 手机号必须脱敏（TODO K21）：此前这里是完整明文 INFO 日志。
         logger.info(
             "AuthStore: user created | id=%d | phone=%s | has_password=%s",
             user_id,
-            phone,
+            mask_phone(phone),
             password_hash is not None,
         )
         return user_id
@@ -195,13 +222,24 @@ class AuthStore:
 
     @staticmethod
     def _row_to_user(row: sqlite3.Row) -> dict[str, Any]:
-        """Convert a ``users`` row into a public dict (never includes hash)."""
+        """Convert a ``users`` row into a dict (never includes ``password_hash``).
+
+        ⚠️ 产物**不是**响应体 —— 对外的一律经 ``router_auth._public_user()``
+        白名单过滤（只放 id / phone / name / email）。因此这里可以带上
+        认证内部字段：``get_current_user`` 每请求都要读 ``token_version``
+        与 ``status``，若再开一个读口就是每请求多一次查询。
+        """
         return {
             "id": row["id"],
             "phone": row["phone"],
             "name": row["name"] or "",
             "email": row["email"],
             "is_active": bool(row["is_active"]),
+            "status": (row["status"] if "status" in row.keys() else "active") or "active",
+            "token_version": (
+                row["token_version"] if "token_version" in row.keys() else 0
+            ) or 0,
+            "deleted_at": row["deleted_at"] if "deleted_at" in row.keys() else None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -246,3 +284,68 @@ class AuthStore:
         conn = _get_conn(self.db_path)
         row = conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone()
         return row is not None
+
+    # ── Deletion / revocation（决策 D119）────────────────────────────────
+    #
+    # 为什么是「软删除 + 延迟物理清理」而不是直接 DELETE：
+    # 用户数据散在 4 个 SQLite 库 + 库外明文文件（见 scripts/purge_deleted_accounts.py），
+    # 物理删除必须跨库级联，中途失败会留下**比不删更难处理**的半删状态，
+    # 而且用户已经看到「删除成功」了。
+    #
+    # 所以拆成两件事：
+    #   ① 立即：标记 status='deleted' + 吊销全部凭据 —— 用户视角「马上生效」；
+    #   ② 30 天后：离线任务做物理级联清理 —— 那时失败可以重跑，代价低得多。
+    # 30 天的窗口同时给了「误删可恢复」的余地。
+
+    def bump_token_version(self, user_id: int) -> int:
+        """Increase ``token_version`` and return the new value.
+
+        这是吊销的全部实现：``get_current_user`` 与 ``/auth/refresh`` 都拿
+        token 里的快照与数据库当前值比对，版本一变，**所有**已签发的
+        access / refresh token 在下一次请求即失效。
+        """
+        conn = _get_conn(self.db_path)
+        conn.execute(
+            "UPDATE users SET token_version = token_version + 1, updated_at = ? WHERE id = ?",
+            (time.time(), user_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT token_version FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return int(row["token_version"]) if row else 0
+
+    def soft_delete_user(self, user_id: int) -> bool:
+        """Mark the account deleted **and** revoke its tokens, in one transaction.
+
+        两步必须同一次提交：只标记不吊销，用户在 90 天 refresh 有效期内仍能
+        继续访问；只吊销不标记，清理任务找不到这个账号。返回是否命中了行。
+        """
+        conn = _get_conn(self.db_path)
+        cur = conn.execute(
+            "UPDATE users "
+            "SET status = 'deleted', deleted_at = ?, "
+            "    token_version = token_version + 1, updated_at = ? "
+            "WHERE id = ? AND status != 'deleted'",
+            (time.time(), time.time(), user_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+    def list_users_deleted_before(self, cutoff_ts: float) -> list[dict[str, Any]]:
+        """Accounts soft-deleted at or before *cutoff_ts* —— 物理清理的输入。"""
+        conn = _get_conn(self.db_path)
+        rows = conn.execute(
+            "SELECT * FROM users "
+            "WHERE status = 'deleted' AND deleted_at IS NOT NULL AND deleted_at <= ? "
+            "ORDER BY deleted_at",
+            (cutoff_ts,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def hard_delete_user(self, user_id: int) -> bool:
+        """Physically remove the account row. Only the purge script should call this."""
+        conn = _get_conn(self.db_path)
+        cur = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        conn.commit()
+        return cur.rowcount > 0

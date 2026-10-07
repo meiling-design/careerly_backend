@@ -501,6 +501,20 @@ def test_llm_outage_does_not_half_succeed(
 # ── 4. 架构边界 ─────────────────────────────────────────────────────────────
 
 
+#: 引擎入参的**白名单**。
+#:
+#: P1-1b 起多了 ``session_id`` —— 它是**会话标识**，不是用户身份：API 层先用它
+#: 建好任务行，引擎再拿同一个 id 跑，于是 ``GET /analysis/tasks/{id}`` 在运行
+#: 期间就能读到节点进度。引擎侧 session 的 ``user_id`` 仍为 NULL（见下）。
+_ALLOWED_ENGINE_KWARGS = {"title", "raw_jd", "resume_text", "session_id"}
+
+#: 明确禁止出现在引擎入参里的身份字段。
+#:
+#: 白名单已经拦住了它们，这里再列一遍是**故意的冗余** —— 白名单日后被逐步放宽
+#: 时，这道断言仍然守着 D-F 的原意（``user_id`` 只活在持久层）。
+_FORBIDDEN_ENGINE_KWARGS = {"user_id", "userId", "user", "phone", "email"}
+
+
 def test_user_identity_never_reaches_the_engine(
     client, careerly_store, graph_store, engine_live
 ):
@@ -509,8 +523,13 @@ def test_user_identity_never_reaches_the_engine(
 
     assert engine_live, "引擎必须被调用过"
     kwargs = engine_live[0]
-    assert set(kwargs) == {"title", "raw_jd", "resume_text"}, \
+
+    # 白名单：新增入参必须在此显式登记，免得有人顺手塞个身份字段进来无人察觉。
+    assert set(kwargs) <= _ALLOWED_ENGINE_KWARGS, \
         f"传给 run_analysis 的参数不应混入用户身份，实际 {sorted(kwargs)}"
+
+    leaked = set(kwargs) & _FORBIDDEN_ENGINE_KWARGS
+    assert not leaked, f"引擎入参混入了用户身份字段：{sorted(leaked)}"
 
 
 def test_analysis_tasks_table_is_user_scoped(client, careerly_store, graph_store, engine_live):

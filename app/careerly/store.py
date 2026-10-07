@@ -165,6 +165,7 @@ class CareerlyStore:
                 text       TEXT NOT NULL DEFAULT '',
                 profile    TEXT,
                 file_name  TEXT,
+                original_pdf BLOB,
                 created_at REAL NOT NULL,
                 is_current INTEGER NOT NULL DEFAULT 0
             );
@@ -201,6 +202,7 @@ class CareerlyStore:
                 status        TEXT NOT NULL,      -- queued|processing|completed|failed
                 title         TEXT NOT NULL DEFAULT '',
                 source        TEXT NOT NULL DEFAULT 'paste',
+                session_id    TEXT,               -- P1-1b：引擎 session 的显式绑定
                 error_code    TEXT,               -- status=failed 时
                 error_message TEXT,
                 created_at    REAL NOT NULL,
@@ -241,6 +243,27 @@ class CareerlyStore:
             CREATE INDEX IF NOT EXISTS idx_snapshots_user ON capability_snapshots(user_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_growth_user ON growth_events(user_id, occurred_at);
         """)
+        # ── 加列迁移 ────────────────────────────────────────────────────
+        # ``CREATE TABLE IF NOT EXISTS`` 对**已存在**的表是空操作，
+        # 所以新增列必须在这里显式 ALTER，否则老库升级后读列就报错。
+        versions_columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(careerly_resume_versions)"
+            ).fetchall()
+        }
+        if "original_pdf" not in versions_columns:
+            conn.execute(
+                "ALTER TABLE careerly_resume_versions ADD COLUMN original_pdf BLOB"
+            )
+        task_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(analysis_tasks)").fetchall()
+        }
+        if "session_id" not in task_columns:
+            # P1-1b：既有库补列。历史任务该列为 NULL —— 它们的引擎 session
+            # 从未被绑定，进度不可回溯（迁移前本就没有可观测面可言）。
+            conn.execute("ALTER TABLE analysis_tasks ADD COLUMN session_id TEXT")
         conn.commit()
 
     # ── Projects ────────────────────────────────────────────────────────
@@ -483,6 +506,7 @@ class CareerlyStore:
         text: str,
         profile: dict | None = None,
         file_name: str | None = None,
+        original_pdf: bytes | None = None,
     ) -> dict[str, Any]:
         """追加一份新简历版本，并把它设为当前简历。
 
@@ -506,9 +530,12 @@ class CareerlyStore:
         )
         conn.execute(
             "INSERT INTO careerly_resume_versions "
-            "(id, user_id, seq, text, profile, file_name, created_at, is_current) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
-            (version_id, user_id, seq, text, _j(profile or {}), file_name, now),
+            "(id, user_id, seq, text, profile, file_name, original_pdf, "
+            "created_at, is_current) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            (
+                version_id, user_id, seq, text, _j(profile or {}),
+                file_name, original_pdf, now,
+            ),
         )
         # 同步「当前简历」基线 —— 不变式见本区块顶部说明。
         conn.execute(
@@ -520,6 +547,20 @@ class CareerlyStore:
         return next(
             v for v in self.list_resume_versions(user_id) if v["id"] == version_id
         )
+
+    def get_resume_version_pdf(
+        self, user_id: int, version_id: str
+    ) -> tuple[str, bytes] | None:
+        """只读取当前用户某个版本保存的原始 PDF。"""
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT file_name, original_pdf FROM careerly_resume_versions "
+            "WHERE user_id = ? AND id = ?",
+            (user_id, version_id),
+        ).fetchone()
+        if row is None or row["original_pdf"] is None:
+            return None
+        return row["file_name"] or "resume.pdf", bytes(row["original_pdf"])
 
     def set_current_resume_version(self, user_id: int, version_id: str) -> bool:
         """把某个历史版本提为当前简历。找不到该版本时返回 `False`。"""
@@ -660,15 +701,30 @@ class CareerlyStore:
     TASK_COMPLETED = "completed"
     TASK_FAILED = "failed"
 
-    def create_task(self, user_id: int, title: str, source: str = "paste") -> str:
-        """Insert a ``queued`` task and return its id."""
+    def create_task(
+        self,
+        user_id: int,
+        title: str,
+        source: str = "paste",
+        session_id: str | None = None,
+    ) -> str:
+        """Insert a ``queued`` task and return its id.
+
+        ``session_id``（P1-1b）—— 预先绑定本次分析将要使用的引擎 session。
+        由 **API 层生成**后同时交给引擎，于是任务在 ``queued``/``processing``
+        期间就能通过 ``GET /analysis/tasks/{id}`` 报告真实节点进度。
+        不传则为 NULL：任务与引擎轨迹无关联，只有终态可观测。
+        """
         task_id = f"task_{uuid.uuid4().hex[:16]}"
         conn = _get_conn(self.db_path)
         conn.execute(
             "INSERT INTO analysis_tasks (id, user_id, project_id, status, title, source, "
-            " error_code, error_message, created_at, started_at, finished_at) "
-            "VALUES (?, ?, NULL, ?, ?, ?, NULL, NULL, ?, NULL, NULL)",
-            (task_id, user_id, self.TASK_QUEUED, title.strip(), source, time.time()),
+            " session_id, error_code, error_message, created_at, started_at, finished_at) "
+            "VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL)",
+            (
+                task_id, user_id, self.TASK_QUEUED, title.strip(), source,
+                session_id, time.time(),
+            ),
         )
         conn.commit()
         return task_id
@@ -729,6 +785,7 @@ class CareerlyStore:
             "taskId": row["id"],
             "status": row["status"],
             "projectId": row["project_id"],
+            "sessionId": row["session_id"],
             "title": row["title"],
             "source": row["source"],
             "errorCode": row["error_code"],

@@ -27,6 +27,7 @@ from typing import Optional
 from app.models.resume import Education, Project, ResumeProfile
 from app.services.llm_service import LLMService
 from app.utils.logger import logger
+from app.utils.redact import mask_name
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RESUME_OUTPUT_DIR = DATA_DIR / "outputs"
@@ -204,8 +205,11 @@ class ResumeAgent:
 
         profile.raw_text = raw_text[:5000]  # keep raw text for reference
         self._save_checkpoint(profile)
+        # ⚠️ 姓名必须脱敏（TODO K21）：此前这里是完整明文 INFO 日志。
+        # 保留首字符 —— 排查时 "name=(none)"（没解析出姓名）
+        # 与 "name=张****"（解析到了）是两个完全不同的结论。
         logger.info("ResumeAgent done | name=%s | skills=%d | exp=%s",
-                      profile.name, len(profile.skills), profile.experience_years)
+                      mask_name(profile.name), len(profile.skills), profile.experience_years)
         return profile
 
     # ── Text Extraction ───────────────────────────────────────────────────

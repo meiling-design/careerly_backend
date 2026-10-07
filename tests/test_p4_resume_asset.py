@@ -215,6 +215,55 @@ def test_txt_file_lands_in_the_same_store(client, careerly_store,
     assert "AI Agent 平台建设" in saved["text"]
 
 
+def test_uploaded_pdf_original_is_retained_and_private(
+    client, careerly_store, fake_resume_llm, monkeypatch
+):
+    headers = _register(client, "13900002015")
+    other_user = _register(client, "13900002016")
+    original_pdf = b"%PDF-1.7 original uploaded manuscript"
+    monkeypatch.setattr(
+        resume_agent_module.ResumeAgent,
+        "_extract_text",
+        lambda self, file_path: _TEXT_RESUME,
+    )
+
+    uploaded = _post_file(
+        client, headers, "张三原稿.pdf", original_pdf, "application/pdf"
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    version_id = uploaded.json()["data"]["version"]["id"]
+
+    preview = client.get(
+        f"/api/v1/resume/versions/{version_id}/original", headers=headers
+    )
+    assert preview.status_code == 200
+    assert preview.content == original_pdf
+    assert preview.headers["content-type"].startswith("application/pdf")
+    assert preview.headers["cache-control"] == "private, no-store"
+
+    forbidden = client.get(
+        f"/api/v1/resume/versions/{version_id}/original", headers=other_user
+    )
+    assert forbidden.status_code == 404
+
+    removed = client.delete(
+        f"/api/v1/resume/versions/{version_id}", headers=headers
+    )
+    assert removed.status_code == 409, "不能删除当前版本"
+
+    # 版本归档后可删除，原稿随版本记录一并删除。
+    replacement = _post_text(client, headers, _TEXT_RESUME)
+    assert replacement.status_code == 200, replacement.text
+    removed = client.delete(
+        f"/api/v1/resume/versions/{version_id}", headers=headers
+    )
+    assert removed.status_code == 200, removed.text
+    missing = client.get(
+        f"/api/v1/resume/versions/{version_id}/original", headers=headers
+    )
+    assert missing.status_code == 404
+
+
 def test_image_runs_ocr_into_the_same_pipeline(client, careerly_store,
                                                fake_resume_llm):
     """截图 OCR → 同一条解析链路，不新建第二套 Profile 逻辑。"""

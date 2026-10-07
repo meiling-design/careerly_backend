@@ -40,14 +40,42 @@ app/data/*.db-shm
 app/data/*.db-wal
 data/*.db
 
+# 库外落盘的用户数据 —— 明文，含真实姓名 / 手机号 / 简历全文（发布基线 K19）
+#
+# app/api/router_app.py 把解析结果写成 data/resumes/{resume_id}.json，
+# 且 JSON 内部就带 user_id。此前只有 data/*.db 被忽略，这两个目录没有 ——
+# 一次 `git add -A` 就会把简历明文提交进仓库。
+# 注意 data/graph_state.db（DemoGuard）与 app/data/graph_state.db（引擎）
+# 是**同名不同文件**，两者都靠上面的 data/*.db 覆盖。
+data/resumes/
+data/uploads/
+
 # WorkBuddy local memory / workspace data
 .workbuddy/
 
 # Pytest 用例自建的临时库目录（刻意不删除：沙箱 safe-delete 会拦截 unlink/rmtree）
-tests/.tmp_p1/
-tests/.tmp_engine/
+#
+# ⚠️ 用通配符，不要枚举具体目录名。此前这里写死了 .tmp_p1/ 与 .tmp_engine/，
+#    于是后来新增的 .tmp_p1b/ 漏网 —— 实测其下 66 个 .db 处于「会被
+#    git add -A 一并收走」的状态。临时目录的命名会随用例增长，枚举必然追不上。
+tests/.tmp_*/
 .pytest_tmp/
 
-# 本地联调产物 —— 接口响应转储 / 真机截图，只在本机有意义
+# 本地联调产物 —— 接口响应转储 / 真机截图 / 库转储，只在本机有意义
+#
+# ⚠️ dbdump.txt 是 careerly_resume_versions 表的**明文转储**：实测内容含
+#    真实姓名、手机号、邮箱，以及原始 PDF 的 base64 BLOB。它与上面的
+#    app/data/*.db 属于同一类「一次 git add -A 就泄露」的文件，
+#    但此前没有被任何规则覆盖。
+#    开头的 / 表示只匹配仓库根目录，避免误伤同名的业务文件。
 /proj.json
+/dbdump.txt
+/openapi_tmp.json
 /*.png
+
+# 联调时落盘的临时令牌（内容是真实 JWT —— 绝不入库）
+.p11b_token
+.*_token
+
+# 备份产物：含真实用户数据（PII），永不入库（发布基线 P0.5）
+backups/

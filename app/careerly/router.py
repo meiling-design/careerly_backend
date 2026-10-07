@@ -6,11 +6,12 @@ shape is dictated by the Dart ``fromJson``/``toJson`` — do not rename fields.
 Endpoints (all require a JWT via ``get_current_user``):
 
     POST /api/v1/analysis                    analyze({title, rawJd}) — synchronous
+    POST /api/v1/analysis/tasks              same, but 202 + taskId (P1-1b 异步)
     GET  /api/v1/analysis/projects           list analysis projects
     GET  /api/v1/analysis/projects/{pid}     one project (jobs + versioned results)
     POST /api/v1/analysis/jobs/parse-url     crawl a job URL → backfill the JD box (③)
     GET  /api/v1/analysis/tasks              list own analysis tasks (P1-1a 可观测)
-    GET  /api/v1/analysis/tasks/{tid}        one task (ownership-scoped)
+    GET  /api/v1/analysis/tasks/{tid}        one task + real node progress (P1-1b)
     POST /api/v1/resume                      submit a resume asset (file/image/text)
                                              → parse → **append a new version**
                                              → make it the current baseline
@@ -38,13 +39,15 @@ import tempfile
 from functools import partial
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from app.agents.resume_agent import ResumeAgent, ResumeExtractionError
 from app.api.envelope import err, ok
 from app.core.security import get_current_user
+from app.core.state_store import StateStore
 from app.careerly import assets as career_assets
 from app.careerly import growth, home, identity
 from app.careerly.ai_context import (
@@ -77,37 +80,119 @@ def get_store() -> CareerlyStore:
     return _store
 
 
+_engine_store: StateStore | None = None
+
+
+def get_engine_store() -> StateStore:
+    """惰性单例 —— 读引擎 session 的实时进度用（P1-1b）。
+
+    ⚠️ 这是**另一个数据库**（``graph_state.db``）。Careerly 的业务数据
+    （``careerly.db``）与引擎轨迹刻意分库，这里只做**只读**的进度查询，
+    不把引擎状态并进业务表。
+    """
+    global _engine_store
+    if _engine_store is None:
+        _engine_store = StateStore()
+    return _engine_store
+
+
+# ── 分析进度：引擎节点 → 产品步骤（P1-1b）───────────────────────────────────
+#
+# 引擎跑 8 个 LangGraph 节点，「正在分析」页只展示 5 步（文案逐字取自 Figma）。
+# 两者**不是一一对应** —— 5 步是 8 节点的产品级抽象。这一步映射只应该有一处
+# 定义：放在契约层（本文件），Flutter 就不需要认识引擎的节点名。
+#
+# | UI 步骤（Figma 原型） | 引擎节点 |
+# |---|---|
+# | 0 岗位需求解析 | ``crawl`` + ``normalize`` |
+# | 1 简历信息解析 | ``resume_embed`` |
+# | 2 能力匹配分析 | ``routing`` + ``match``（含 ``recrawl`` 回环） |
+# | 3 识别能力 Gap | ``rank`` |
+# | 4 生成分析报告 | ``report`` |
+ANALYSIS_STEP_COUNT = 5
+
+_NODE_TO_STEP: dict[str, int] = {
+    "crawl": 0,
+    "normalize": 0,
+    "resume_embed": 1,
+    "routing": 2,
+    "match": 2,
+    "recrawl": 2,
+    "rank": 3,
+    "report": 4,
+}
+
+#: 建图时登记的节点总数（``orchestrator.DecisionGraph``）。
+#: ⚠️ 与 UI 的 5 步**不是同一个刻度**，故响应里分成两个字段各自报告，
+#: 不要拿它去除以 ``totalSteps``。
+ENGINE_NODE_COUNT = 8
+
+
+def _progress_payload(session_id: str | None) -> dict[str, Any] | None:
+    """把引擎 session 的实时进度翻译成任务响应里的 ``progress``。
+
+    读不到（没有 session / 尚未开始 / 引擎未落进度）时返回 ``None`` ——
+    客户端据此显示「排队中」，而**不是**伪造一个 0% 进度。
+    """
+    if not session_id:
+        return None
+    raw = get_engine_store().get_session_progress(session_id)
+    if not raw:
+        return None
+    node = raw.get("current_node")
+    return {
+        "currentNode": node,
+        "nodeStatus": raw.get("node_status"),
+        "completedCount": raw.get("completed_count"),
+        "totalNodes": ENGINE_NODE_COUNT,
+        # 产品步骤（0 基）。未知节点 → None，客户端保持当前步不动。
+        "stepIndex": _NODE_TO_STEP.get(node) if isinstance(node, str) else None,
+        "totalSteps": ANALYSIS_STEP_COUNT,
+        "updatedAt": raw.get("_updated_at"),
+    }
+
+
 # ── Analysis ────────────────────────────────────────────────────────────────
 
 
-@router.post("/analysis")
-async def analyze(
+def _prepare_task(
+    store: CareerlyStore,
+    user_id: int,
     req: AnalyzeRequest,
-    current_user: dict = Depends(get_current_user),
-):
-    """Run one Gap analysis for a pasted JD and return the full project."""
-    store = get_store()
-    user_id = int(current_user["id"])
+) -> tuple[Any, str | None, str | None, str | None]:
+    """建任务 + 跑前置校验。返回 ``(错误响应, task_id, session_id, resume_text)``。
 
-    # ── P1-1a：任务留痕。**在一切校验之前**建任务。
-    #
-    # 为什么必须在最前面：配额不足、缺少基线这类前置拒绝恰恰是最常见的失败，
-    # 若等校验通过才建任务，它们就一个记录都不会留下 —— 「失败无痕」正是
-    # P1-2 要消灭的东西。前置拒绝同样记 failed（started_at 保持 NULL，
-    # 表示引擎从未真正启动）。
-    #
-    # 对外语义不变：仍等待完成后返回结果，Flutter 零改动（D-A ②第一阶段）。
-    task_id = store.create_task(user_id, req.title, source="paste")
+    ── P1-1a：任务留痕，**在一切校验之前**建任务。
+    为什么必须在最前面：配额不足、缺少基线这类前置拒绝恰恰是最常见的失败，
+    若等校验通过才建任务，它们就一个记录都不会留下 —— 「失败无痕」正是
+    P1-2 要消灭的东西。前置拒绝同样记 failed（started_at 保持 NULL，
+    表示引擎从未真正启动）。
+
+    ── P1-1b：session id 在这里**先于引擎**生成。顺序是刻意的：
+    先生成 id → 写进任务行 → 交给引擎，运行期间 ``GET /analysis/tasks/{id}``
+    才有东西可查。反过来（等引擎自己生成再回写）在同步接口下永远拿不到。
+
+    前置拒绝时后三个返回值为 ``None``，调用方直接返回 ``错误响应``。
+    """
+    session_id = StateStore.new_session_id()
+    task_id = store.create_task(
+        user_id, req.title, source="paste", session_id=session_id,
+    )
 
     # Quota gate (Baseline §5 / PRD §16): free users get 3 analyses total.
     quota = store.get_quota(user_id)
     if not quota.isMember and quota.used >= quota.total:
         store.fail_task(task_id, "QUOTA_EXCEEDED", "免费分析次数已用完")
-        return err(
-            "QUOTA_EXCEEDED",
-            "免费分析次数已用完，升级会员后可继续分析",
-            403,
-            details={"quota": dump(quota)},
+        return (
+            err(
+                "QUOTA_EXCEEDED",
+                "免费分析次数已用完，升级会员后可继续分析",
+                403,
+                details={"quota": dump(quota)},
+            ),
+            None,
+            None,
+            None,
         )
 
     # Resume source: inline text wins, else the persisted baseline (P3).
@@ -120,26 +205,47 @@ async def analyze(
         # 否则「内联简历缺失」和「基线缺失」会给出两个不同的 code，前端无法统一处理。
         message = "尚未建立职业基线：请先上传简历或传入 resumeText"
         store.fail_task(task_id, "NO_BASELINE", message)
-        return err("NO_BASELINE", message, 422)
+        return err("NO_BASELINE", message, 422), None, None, None
 
-    store.start_task(task_id)
+    return None, task_id, session_id, resume_text
 
+
+async def _execute_analysis(
+    *,
+    store: CareerlyStore,
+    user_id: int,
+    task_id: str,
+    session_id: str,
+    title: str,
+    raw_jd: str,
+    resume_text: str,
+):
+    """跑引擎并把成功产物落库；返回 ``AnalysisProject``。
+
+    失败一律抛 [AnalysisError]（含把意外崩溃归一化），由调用方决定是
+    返回 HTTP 错误还是把任务标记为 failed。
+
+    ⚠️ 同步 ``POST /analysis`` 与异步 ``POST /analysis/tasks`` **共用这一段**。
+    两条入口只有「要不要等」不同；校验、引擎调用、落库必须逐字一致，
+    否则同一份 JD 走不同入口会得到不同的库状态。
+    """
     loop = asyncio.get_running_loop()
     try:
         project, resume_profile = await loop.run_in_executor(
             None,
-            partial(run_analysis, title=req.title, raw_jd=req.rawJd, resume_text=resume_text),
+            partial(
+                run_analysis,
+                title=title,
+                raw_jd=raw_jd,
+                resume_text=resume_text,
+                session_id=session_id,
+            ),
         )
-    except AnalysisError as exc:
-        # P1-2：失败必须落库，消灭「失败无痕」。
-        store.fail_task(task_id, exc.code, exc.message)
-        logger.warning("Careerly analyze failed | user=%d | task=%s | code=%s",
-                       user_id, task_id, exc.code)
-        return err(exc.code, exc.message, exc.status_code)
+    except AnalysisError:
+        raise
     except Exception as exc:  # pragma: no cover - unexpected engine crash
-        store.fail_task(task_id, "ANALYSIS_FAILED", str(exc))
         logger.exception("Careerly analyze crashed | user=%d | task=%s", user_id, task_id)
-        return err("ANALYSIS_FAILED", f"分析失败：{exc}", 502)
+        raise AnalysisError("ANALYSIS_FAILED", f"分析失败：{exc}", 502) from exc
 
     store.save_project(user_id, project)
     # P3-1：把引擎解析出的简历画像落库 —— 这是「我的 → 职业资产」的真实数据源。
@@ -151,10 +257,108 @@ async def analyze(
     growth.record_analysis_growth(store, user_id, project)  # P2：快照 + 成长事件
     store.consume_quota(user_id)
     store.complete_task(task_id, project.id)
-    logger.info("Careerly analyze | user=%d | project=%s | task=%s | quota=%d/%d",
-                user_id, project.id, task_id, quota.used + 1, quota.total)
+    return project
 
+
+#: 后台分析任务的强引用。不保存引用的话，asyncio 可能在任务跑完前
+#: 把它回收掉（事件循环只持弱引用）。
+_background_tasks: set[asyncio.Task] = set()
+
+
+@router.post("/analysis")
+async def analyze(
+    req: AnalyzeRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Run one Gap analysis for a pasted JD and return the full project.
+
+    **同步**（决策 C2 / D-A ② 第一阶段）：等引擎跑完 8 节点才返回，
+    Flutter 零改动。需要看真实节点进度的客户端走 ``POST /analysis/tasks``。
+    """
+    store = get_store()
+    user_id = int(current_user["id"])
+
+    failure, task_id, session_id, resume_text = _prepare_task(store, user_id, req)
+    if failure is not None:
+        return failure
+
+    store.start_task(task_id)
+    try:
+        project = await _execute_analysis(
+            store=store,
+            user_id=user_id,
+            task_id=task_id,
+            session_id=session_id,
+            title=req.title,
+            raw_jd=req.rawJd,
+            resume_text=resume_text,
+        )
+    except AnalysisError as exc:
+        # P1-2：失败必须落库，消灭「失败无痕」。
+        store.fail_task(task_id, exc.code, exc.message)
+        logger.warning("Careerly analyze failed | user=%d | task=%s | code=%s",
+                       user_id, task_id, exc.code)
+        return err(exc.code, exc.message, exc.status_code)
+
+    logger.info("Careerly analyze | user=%d | project=%s | task=%s",
+                user_id, project.id, task_id)
     return ok(dump(project), status_code=201)
+
+
+@router.post("/analysis/tasks")
+async def start_analysis_task(
+    req: AnalyzeRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """**异步**入口（P1-1b）：立刻返回 202 + ``taskId``，分析在后台跑。
+
+    与同步 ``POST /analysis`` **并存**，不是替换 —— 见 D-A ②「双模兼容」。
+    客户端拿到 ``taskId`` 后轮询 ``GET /analysis/tasks/{taskId}``，
+    即可用真实节点推进「正在分析」页的 5 步动效。
+
+    额度语义不变（Baseline §5）：仍然**成功才扣**，失败/前置拒绝不扣。
+    """
+    store = get_store()
+    user_id = int(current_user["id"])
+
+    failure, task_id, session_id, resume_text = _prepare_task(store, user_id, req)
+    if failure is not None:
+        return failure
+
+    store.start_task(task_id)
+
+    async def _background() -> None:
+        try:
+            project = await _execute_analysis(
+                store=store,
+                user_id=user_id,
+                task_id=task_id,
+                session_id=session_id,
+                title=req.title,
+                raw_jd=req.rawJd,
+                resume_text=resume_text,
+            )
+        except AnalysisError as exc:
+            store.fail_task(task_id, exc.code, exc.message)
+            logger.warning("Careerly async analyze failed | user=%d | task=%s | code=%s",
+                           user_id, task_id, exc.code)
+            return
+        except Exception as exc:  # pragma: no cover - 落库阶段的意外
+            store.fail_task(task_id, "ANALYSIS_FAILED", str(exc))
+            logger.exception("Careerly async analyze crashed | user=%d | task=%s",
+                             user_id, task_id)
+            return
+        logger.info("Careerly async analyze | user=%d | project=%s | task=%s",
+                    user_id, project.id, task_id)
+
+    task = asyncio.create_task(_background())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    return ok(
+        {"taskId": task_id, "status": CareerlyStore.TASK_PROCESSING},
+        status_code=202,
+    )
 
 
 @router.get("/analysis/projects")
@@ -217,10 +421,14 @@ async def get_project(
     return ok(dump(project))
 
 
-# ── Analysis tasks（P1-1a 可观测面）────────────────────────────────────────
+# ── Analysis tasks（P1-1a 可观测面 / P1-1b 进度面）─────────────────────────
 #
-# 只读、按 user 作用域。这里**不**提供 202 + 轮询 —— 那属于 P1-1b，
-# 等状态机稳定后再引入，避免一次性搅动 Flutter / API / Agent 三层。
+# 全部按 user 作用域。P1-1a 只读终态；P1-1b 起单任务读**实时节点进度**。
+#
+# ⚠️ 归属纪律：进度是从**引擎库**按 ``sessionId`` 读的，而 ``sessionId``
+# 来自任务行。所以必须**先**用 ``store.get_task(user_id, task_id)`` 确认
+# 该任务属于当前用户，**再**拿它携带的 sessionId 去查进度 —— 绝不能让
+# 客户端直接传 session_id 进来查。否则就是一条绕过任务归属的越权读路径。
 
 
 @router.get("/analysis/tasks")
@@ -228,7 +436,11 @@ async def list_tasks(
     limit: int = 50,
     current_user: dict = Depends(get_current_user),
 ):
-    """本人最近的分析任务（含失败原因与耗时）。"""
+    """本人最近的分析任务（含失败原因与耗时）。
+
+    ⚠️ **不**在这里附带 ``progress``：列表是终态历史，逐条去引擎库查进度
+    会产生 N+1 次查询，而列表页也不需要实时进度。要看进度请查单任务。
+    """
     store = get_store()
     return ok(store.list_tasks(int(current_user["id"]), limit=limit))
 
@@ -243,6 +455,9 @@ async def get_task(
     if task is None:
         # 与越权同码：404，不泄露「该 task_id 是否存在」
         return err("NOT_FOUND", f"分析任务 {task_id} 不存在", 404)
+    # P1-1b：附上引擎的实时节点进度。``None`` = 读不到（无绑定 / 未开始），
+    # 客户端据此显示「排队中」而不是伪造进度。
+    task["progress"] = _progress_payload(task.get("sessionId"))
     return ok(task)
 
 
@@ -304,6 +519,7 @@ async def create_resume_asset(
     agent = ResumeAgent()
     #: 原始文件名，记进版本卡（[ResumeVersion.fileName]）。粘贴文本时为 None。
     source_name: str | None = None
+    original_pdf: bytes | None = None
 
     try:
         if file is not None and file.filename:
@@ -322,6 +538,8 @@ async def create_resume_asset(
                 return err("VALIDATION_ERROR", "文件内容为空", 422)
             if len(content) > _RESUME_MAX_BYTES:
                 return err("FILE_TOO_LARGE", "文件超过 10MB 上限", 413)
+            if suffix == ".pdf":
+                original_pdf = content
 
             # ResumeAgent 按路径读文件（pdfplumber / python-docx / PIL 都要路径），
             # 故先落临时文件，解析完立刻整目录删除。
@@ -385,6 +603,7 @@ async def create_resume_asset(
         resume_text,
         profile_dump if structured else (previous.get("profile") or {}),
         file_name=source_name,
+        original_pdf=original_pdf,
     )
     saved = store.get_resume(user_id) or {}
     logger.info(
@@ -398,6 +617,31 @@ async def create_resume_asset(
         "version": version,
         "versions": store.list_resume_versions(user_id),
     })
+
+
+@router.get("/resume/versions/{version_id}/original")
+async def get_resume_version_original_pdf(
+    version_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """读取当前用户指定简历版本上传的原始 PDF。"""
+    original = get_store().get_resume_version_pdf(
+        int(current_user["id"]), version_id
+    )
+    if original is None:
+        return err("NOT_FOUND", "该版本没有可用的原始 PDF", 404)
+
+    file_name, content = original
+    return Response(
+        content=content,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": (
+                f"inline; filename*=UTF-8''{quote(file_name, safe='')}"
+            ),
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 
 @router.put("/resume")

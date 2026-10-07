@@ -48,6 +48,7 @@ from app.agents.resume_agent import ResumeAgent
 from app.core.security import get_current_user
 from app.core.state_store import StateStore
 from app.utils.logger import logger
+from app.utils.redact import mask_filename
 
 # ── Router ──────────────────────────────────────────────────────────────────
 
@@ -211,12 +212,16 @@ async def upload_resume(
         resume_id = f"resume_{uuid.uuid4().hex[:8]}"
         summary = _save_resume_meta(resume_id, file.filename, profile, user_id=user_id)
 
+        # ⚠️ 文件名必须脱敏（TODO K21）：上传文件名常含真实姓名。
+        # 只留扩展名 —— 它是排查"为什么解析失败"的第一手信息
+        # （.doc 与 .docx 走完全不同的分支）。
         logger.info("Resume uploaded & parsed | id=%s | name=%s | skills=%d",
-                    resume_id, file.filename, len(profile.skills))
+                    resume_id, mask_filename(file.filename), len(profile.skills))
         return _ok(summary, status_code=200)
 
     except Exception as exc:
-        logger.error("Resume upload failed | file=%s | %s", file.filename, exc)
+        # ⚠️ 失败分支同样要脱敏 —— 这里是 ERROR 级，生产必输出（TODO K21）。
+        logger.error("Resume upload failed | file=%s | %s", mask_filename(file.filename), exc)
         return _err("PARSE_ERROR", f"Failed to parse resume: {exc}", 500)
 
     finally:

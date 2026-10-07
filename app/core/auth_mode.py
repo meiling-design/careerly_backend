@@ -38,14 +38,15 @@ from __future__ import annotations
 
 import os
 
+# 异常定义在 config_guard（不参与重载的模块），在此**原样再导出** ——
+# 既有 `from app.core.auth_mode import InsecureAuthConfiguration` 不受影响，
+# 且两类导入拿到的是同一个类对象。搬家的原因见 config_guard 模块文档。
+from app.core.config_guard import InsecureAuthConfiguration
+
 AUTH_MODE_DEV = "dev"
 AUTH_MODE_FORMAL = "formal"
 
 _PRODUCTION_ENVS = frozenset({"production", "prod"})
-
-
-class InsecureAuthConfiguration(RuntimeError):
-    """生产环境启用了 DEV 认证 —— 拒绝启动。"""
 
 
 def get_env() -> str:

@@ -1,0 +1,77 @@
+# ── Careerly 后端 Docker 构建上下文排除表 ──────────────────────────────
+#
+# 为什么这个文件是**必需**的而不是优化项
+# ----------------------------------------
+# Dockerfile:44 是 `COPY . .` —— 构建上下文里的**每一个文件**都会进入镜像层。
+# 本仓库此前没有这个文件，于是下列内容会全部被打进镜像：
+#
+#   .env            真实的 DASHSCOPE_API_KEY / TAVILY_API_KEY / LANGSMITH_API_KEY
+#   venv/           本机虚拟环境（数百 MB）
+#   backups/        含真实用户 PII 的 SQLite 备份
+#   app/data/*.db   真实用户数据（账号、简历全文、原始 PDF BLOB）
+#   .git/           完整提交历史
+#
+# 镜像层是**只增不减**的：一旦推上去，删掉文件也删不掉这一层里的密钥。
+# .gitignore 挡不住这个 —— 它管的是 git，管的是「推到 GitHub 的东西」，
+# 而 Docker 构建上下文与 git 无关。两者必须各写一份。
+#
+# ⚠️ 修改本文件后，构建缓存会失效，首次重建会变慢，这是正常的。
+
+# ── 密钥 ───────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+# .env.example 刻意保留：它只有占位值，是配置文档的一部分。
+
+# ── 版本控制与 CI ──────────────────────────────────────────────────────
+.git/
+.gitignore
+.github/
+
+# ── Python 虚拟环境与缓存 ──────────────────────────────────────────────
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 运行时数据：SQLite / WAL / 上传件 / 分析产物 ───────────────────────
+# 这些目录会在运行时由代码自动创建（`mkdir(parents=True, exist_ok=True)`），
+# 例如 app/core/auth_store.py:71 —— 镜像里不需要预置它们的存在。
+# 生产数据必须由 Railway Volume 承载，绝不能来自镜像。
+app/data/*.db
+app/data/*.db-shm
+app/data/*.db-wal
+app/data/uploads/
+app/data/outputs/
+data/
+
+# ── 备份与本地联调产物 ─────────────────────────────────────────────────
+backups/
+*.log
+*.png
+proj.json
+openapi_tmp.json
+dbdump.txt
+.p11b_token
+.*_token
+.workbuddy/
+.qa/
+.pytest_tmp/
+
+# ── 运行时用不到的内容 ─────────────────────────────────────────────────
+tests/
+docs/
+*.md
+
+# ── 刻意**不**排除（删掉会出问题，勿动）────────────────────────────────
+# config.yaml                  启动时由 app/core/config.py:19 读取，
+#                              缺失会让 AppConfig 退回全默认值（LLM 静默换模型）
+# scripts/*.py                 Phase 3 需在容器内执行
+#                              scripts/purge_passwordless_accounts.py
+# app/data/tessdata/           OCR 中文语言包 chi_sim.traineddata
+# requirements.txt / main.py   — 默认保留

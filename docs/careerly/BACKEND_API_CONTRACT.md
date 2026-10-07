@@ -18,7 +18,7 @@
 |---|---|---|
 | — | Flutter 契约 → 后端端点映射 | ✅ 已推导；实际对接范围见 **§0.5.1** |
 | C1 | **认证身份字段**：手机号（D85）vs 邮箱+密码 | ✅ **已裁决**：手机号直登，`DEV 可用 / PROD 硬阻断`（D-NEW 方案 A）。`app/core/auth_mode.py` 导入期 fail-fast |
-| C2 | 分析调用形态：同步 vs 异步 | ✅ **已裁决 D-A ②**：对外同步（Flutter 零改动），内部保留任务状态机便于升级异步 |
+| C2 | 分析调用形态：同步 vs 异步 | ✅ **已裁决 D-A ②**：对外同步（Flutter 零改动），内部保留任务状态机便于升级异步。<br>**P1-1b（2026-10-05）落地「双模」**：同步端点保留不动，**新增**异步入口 `POST /analysis/tasks`（202 + 轮询）。Flutter 真实后端路径改走异步，Mock 路径仍走同步 —— 见 **§0.5.9** |
 | C3 | 额度规则 | ✅ **已落地**：`careerly.db: user_quota`（免费 3 次），仅分析**成功**后扣减，失败不扣 |
 | C4 | 能力分值模型缺失 | ✅ **已落地**：`LLMService.score_capabilities()` + `capability.normalize()` 严格校验 + 完整降级。🔧 **P1-5 修复了一处取值 bug**（见 §0.5.6） |
 | C5 | 会话持久化 → user_id 隔离无处落地 | ✅ **已落地**：**D-B 推翻 D52** —— token 安全持久化（Android Keystore / iOS Keychain），refresh 90 天。冷启动不再丢失身份主体 |
@@ -43,13 +43,18 @@
 | `ResumeRepository.submitResumeText` | `POST /api/v1/resume`（multipart `text`） | JWT | **提交即解析**（ResumeAgent），返回 `{text, profile, updatedAt}` |
 | `ResumeRepository.submitResumeFile` | `POST /api/v1/resume`（multipart `file`） | JWT | 同上；PDF / DOCX / TXT / 图片（OCR） |
 | `ResumeRepository.fetchProfile` | `GET /api/v1/resume` | JWT | 无基线时返回 `null` |
-| `AnalysisRepository.analyze` | `POST /api/v1/analysis` | JWT | **同步**跑完 LangGraph 8 节点后返回（10–210s） |
+| `ResumeRepository.fetchVersionOriginalPdf` | `GET /api/v1/resume/versions/{id}/original` | JWT | 仅返回该用户已上传并按版本保存的 PDF 原稿；版本删除时原稿一并删除 |
+| `AnalysisRepository.analyze` | `POST /api/v1/analysis` | JWT | **同步**跑完 LangGraph 8 节点后返回（10–210s）。Mock 路径仍走它 |
+| `AnalysisProgressSource.startAnalysisTask` | `POST /api/v1/analysis/tasks` | JWT | **P1-1b**（2026-10-05）：202 + `taskId`，后台跑。真实后端的分析入口 |
+| `AnalysisProgressSource.fetchAnalysisTask` | `GET /api/v1/analysis/tasks/{id}` | JWT | **P1-1b**：轮询读真实节点进度，详见 **§0.5.9** |
 | `AnalysisRepository.parseJobUrl` | `POST /api/v1/analysis/jobs/parse-url` | JWT | P4-3；不扣额度、不建任务 |
 | `AnalysisRepository.fetchProjects` | `GET /api/v1/analysis/projects` | JWT | |
 | `AnalysisRepository.fetchProject` | `GET /api/v1/analysis/projects/{id}` | JWT | 越权 → 404 |
 | `AnalysisRepository.fetchJobLibrary` | `GET /api/v1/analysis/jobs` | JWT | |
 | `AnalysisRepository.fetchQuota` | `GET /api/v1/quota` | JWT | ⚠️ 路径与 §1 草案不同，见 §0.5.5 |
 | `AIRepository.sendMessage` | `POST /api/v1/ai/messages` | JWT | **SSE 流**，详见 **§0.5.8**（2026-10-04 由 §0.5.2 移入） |
+| `AuthRepository.deleteCareerData` | `DELETE /api/v1/account/career-data` | JWT | 删除可归属的职业数据与文件；账号、token 保留；返回行/文件计数与未完成提示 |
+| `AuthRepository.deleteAccount` | `DELETE /api/v1/account` | JWT | 立即软删除账号并吊销 token；30 天后级联物理清理 |
 
 > 另有 `POST /api/v1/auth/refresh`（刷新令牌）与 `GET /api/v1/auth/me`，由 `ApiClient`
 > 在 401 时自动调用，Flutter Repository 层不直接感知。
@@ -65,8 +70,8 @@
 
 | 方法与路径 | 状态 | 卡在哪 |
 |---|---|---|
-| `GET /api/v1/analysis/tasks` | ✅ 已建（P1-1a） | Flutter 未接；等 P1-1b 定「要不要轮询」 |
-| `GET /api/v1/analysis/tasks/{id}` | ✅ 已建（P1-1a） | 同上 |
+| `GET /api/v1/analysis/tasks` | ✅ 已建（P1-1a） | Flutter 未接（列表是终态历史，不需要实时进度） |
+| `GET /api/v1/analysis/tasks/{id}` | ✅ 已建（P1-1a / **P1-1b 加实时进度**） | **已接**：`ApiAnalysisRepository.fetchAnalysisTask`，见 §0.5.9 |
 | `POST /api/v1/resume/upload` | ✅ 已建（multipart） | **已被取代，勿再新增调用**：统一入口是 `POST /api/v1/resume`（文件 / 图片 / 文本三合一）。旧端点只收 pdf/docx/txt，与 Flutter 白名单不一致 —— 属历史包袱 |
 
 ### 0.5.3 P3 新增：已落地且已对接（2026-10-02 回写）
@@ -206,6 +211,62 @@ POST /api/v1/ai/messages          Authorization: Bearer <JWT>
 `app/careerly/store.py`（`get_ai_quota` / `consume_ai_quota`）·
 `app/services/llm_service.py::chat_stream` · 回归套件 `tests/test_p5_ai_messages.py`。
 
+### 0.5.9 P1-1b 落地：分析进度可观测（2026-10-05）
+
+> **背景**：`GET /api/v1/analysis/tasks/{id}` 自 P1-1a 就在，但它只报**终态**，
+> 而引擎每个节点**早就在写**实时进度（`orchestrator.py::_update_status` →
+> `store.update_session_progress`）。缺的从来不是数据，是**关联**：
+> `analysis_tasks` 行与引擎的 `session_id` 之间没有绑定，而且
+> `POST /analysis` 是同步的 —— 客户端在运行期间拿不到任何句柄。
+>
+> **后果**（本次修掉的真实缺陷）：Flutter 的「正在分析」页只能靠组件内的
+> 一只**本地时钟**驱动，7.3 秒就跑完并定形「分析完成」。而实测引擎单是
+> `routing` 一个节点就可能跑 **100 秒以上**（契约 C2：10–210s）——
+> 用户在「已完成」的画面上等一个还在飞的请求。
+
+**改了什么**
+
+| 层 | 改动 |
+|---|---|
+| `analysis_tasks` | 新增 `session_id` 列（含既有库的 `ALTER TABLE` 迁移） |
+| `CareerlyStore.create_task` | 收 `session_id`；`_task_row` 回吐 `sessionId` |
+| `StateStore.create_session` | 新增 `session_id=` 参数：允许调用方指定 id（不传则沿用自动命名） |
+| `StateStore.get_session_progress` | 新增读侧 API（原先只有写） |
+| `DecisionGraph.run` | 显式传入 session id 时，`create_session` 必须带同一个 id —— 否则 `sessions` 表没有该行，后续每个节点的进度写入都静默 return，表现为「任务永远 processing、进度不动」 |
+| `run_analysis` | 透传 `session_id` |
+| `POST /analysis/tasks` | **新增**：202 + `taskId`，后台执行 |
+| `GET /analysis/tasks/{id}` | 附 `progress`（`_progress_payload`，含 `_NODE_TO_STEP` 映射） |
+
+**关键设计点**
+
+- **绑定顺序是刻意的**：API 层先 `StateStore.new_session_id()` → 写进任务行 →
+  交给引擎。反过来（等引擎自己生成再回写）在同步接口下永远拿不到 id。
+- **映射单点**：引擎 8 节点 → 产品 5 步的对应关系只写在
+  `app/careerly/router.py::_NODE_TO_STEP`，Flutter 不认识引擎节点名。
+- **归属纪律**：进度是按任务行携带的 `sessionId` 去**另一个库**读的。
+  必须**先** `get_task(user_id, task_id)` 确认归属，**再**用它查进度 ——
+  不能让客户端直接传 `session_id` 进来查，那是一条绕过任务归属的越权读路径。
+- **两个刻度不混用**：`completedCount/totalNodes` 是引擎刻度，
+  `stepIndex/totalSteps` 是产品刻度。响应里分开成两组字段，理由见 §2.1b。
+
+**关联的 Flutter 侧改动**（`careerly` 仓库）
+
+`AnalysisProgressSource`（新增能力接口，只有 `ApiAnalysisRepository` 实现）·
+`AnalysisTask` / `AnalysisTaskProgress` 模型 ·
+`AnalysisProvider` 的轮询（`ApiClient.analysisPollInterval`）·
+`CareerlyAnalysisProgress.progress` 的两种驱动模式。
+
+> Mock **不**实现 `AnalysisProgressSource` —— 它背后没有 agent 流程，
+> 没有节点可报告。强行统一只能靠编造节点名，那是 `CLAUDE.md` §7 禁止的。
+> 所以 Mock 路径沿用组件内时钟，真实后端路径用真实节点。
+
+**尚未做的**（明确留着，不在本次范围）
+
+- 未做 SSE：轮询足够，且 SSE 要动 Flutter 的传输层。
+- 未做断线续接：客户端重连后要靠 `GET /analysis/tasks` 找回未完成任务。
+- 额度上限的并发竞态未加锁：两个异步请求可同时通过配额门禁
+  （同步路径本来就无此问题，因为它在一请求内串行）。影响面小，先记录。
+
 ---
 
 ## 1. 契约总表（Flutter Repository → 后端端点）
@@ -259,6 +320,58 @@ POST /api/v1/ai/messages          Authorization: Bearer <JWT>
 → 后端必须走 `GraphState.manual_job_texts` 分支构造 `JobPosting`，**不得要求 URL**。
 
 **Response**：`AnalysisProject`（见 §3.1）。
+
+### 2.1b `POST /api/v1/analysis/tasks`（P1-1b · 异步入口）
+
+与 §2.1 **同一个请求体**，但**立刻**返回 `202`，分析在后台跑。
+
+```json
+{ "title": "AI 产品经理", "rawJd": "<岗位 JD 原文>" }
+
+→ 202
+{ "success": true, "data": { "taskId": "task_…", "status": "processing" }, … }
+```
+
+对应 `AnalysisProgressSource.startAnalysisTask`（Dart）。客户端随后轮询
+`GET /api/v1/analysis/tasks/{taskId}` 直到终态，再用 `projectId` 取结果。
+
+- 与同步端点**并存**，不是替换（D-A ②「双模兼容」）。
+- 额度语义不变：**成功才扣**，前置拒绝（`QUOTA_EXCEEDED` / `NO_BASELINE`）
+  与引擎失败都不扣。
+
+**轮询响应**（在 P1-1a 的任务字段之外，多了 `sessionId` 与 `progress`）：
+
+```json
+{ "taskId": "task_…", "status": "processing", "projectId": null,
+  "sessionId": "session-…",
+  "progress": {
+    "currentNode": "routing", "nodeStatus": "running",
+    "completedCount": 4, "totalNodes": 8,
+    "stepIndex": 2, "totalSteps": 5,
+    "updatedAt": 1791201608.26 } }
+```
+
+⚠️ **两个刻度，不要混用**：
+
+```text
+completedCount / totalNodes   引擎节点刻度（8 个 LangGraph 节点）
+stepIndex      / totalSteps   产品步骤刻度（「正在分析」页的 5 步）
+```
+
+5 步是 8 节点的**产品级抽象**，映射由后端 `app/careerly/router.py` 的
+`_NODE_TO_STEP` **单点维护**，客户端不需要认识引擎节点名：
+
+| UI 步骤 | 引擎节点 |
+|---|---|
+| 0 岗位需求解析 | `crawl` + `normalize` |
+| 1 简历信息解析 | `resume_embed` |
+| 2 能力匹配分析 | `routing` + `match`（含 `recrawl` 回环） |
+| 3 识别能力 Gap | `rank` |
+| 4 生成分析报告 | `report` |
+
+`progress` 为 `null` = 还没有可报告的进度（排队中 / 任务未绑定 session）。
+遇到映射表外的节点时 `stepIndex` 也为 `null` —— 客户端应**保持当前步不动**，
+不要回退到第 0 步。
 
 ### 2.2 `AnalysisProject` JSON（Dart `AnalysisProject.toJson` 逐字）
 

@@ -798,11 +798,15 @@ class DecisionGraph:
             if restored:
                 logger.info("Session restored | id=%s | keys=%s", sid, list(restored.keys()))
         elif not session_exists:
+            # ⚠️ 必须带上 ``session_id=sid``：调用方显式传入 id 时，
+            # 若这里让它自动生成一个新的，``sessions`` 表里就**没有 sid 这一行**，
+            # 后续每个节点的 ``update_session_progress(sid, ...)`` 会因查不到行
+            # 而静默 return —— 表现为「任务一直是 queued，进度永远不动」。
             self.store.create_session({
                 "job_urls": len(job_urls),
                 "use_llm": use_llm,
                 "use_embedding": use_embedding,
-            })
+            }, session_id=sid)
 
         # Build initial state — merge restored data with fresh run params
         initial_state = GraphState(

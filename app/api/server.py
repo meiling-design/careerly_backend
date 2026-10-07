@@ -21,7 +21,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.api.middleware import add_api_middleware
-from app.core.auth_mode import assert_auth_configuration_is_safe, auth_mode_banner
+from app.core.auth_mode import (
+    assert_auth_configuration_is_safe,
+    auth_mode_banner,
+    is_production,
+)
+from app.core.config_guard import InsecureCorsConfiguration
 from app.core.errors import AppError, ResourceNotFound
 from app.core.orchestrator import DecisionGraph
 from app.core.security import get_current_user
@@ -49,10 +54,24 @@ app = FastAPI(
 #   - Otherwise fall back to a permissive "*" but with credentials DISABLED
 #     (the "*" + credentials=True combo is invalid per the CORS spec and is
 #     silently ignored/blocked by browsers).
+#
+# 生产环境**不允许**这个回退（发布基线 K24）。`*` 在开发时很方便，但生产
+# 意味着任何站点都能从用户浏览器直接调用本 API。与 JWT 密钥同样处理 ——
+# 缺失即拒绝启动，而不是静默降级成一个「能跑但不安全」的形态。
 _cors_origins_raw = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
 if _cors_origins_raw:
     _allow_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
     _allow_credentials = True
+elif is_production():
+    raise InsecureCorsConfiguration(
+        "拒绝启动：ENV=production 但未设置 CORS_ALLOW_ORIGINS。\n"
+        "  留空会回退到 allow_origins=['*'] —— 任何站点都能从用户浏览器"
+        "直接调用本 API。\n"
+        "  生产必须显式列出允许来源（逗号分隔），例如：\n"
+        "    CORS_ALLOW_ORIGINS=https://app.example.com\n"
+        "  注：移动端 App 不走浏览器同源策略，不受本项约束；"
+        "这里限制的是 Web / 管理端来源。"
+    )
 else:
     _allow_origins = ["*"]
     _allow_credentials = False

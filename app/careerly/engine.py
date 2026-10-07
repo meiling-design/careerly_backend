@@ -216,6 +216,7 @@ def run_analysis(
     resume_text: str,
     use_llm: bool = True,
     use_embedding: bool = True,
+    session_id: str | None = None,
 ) -> tuple[AnalysisProject, dict]:
     """Run the matching engine for one pasted JD and map it to a project.
 
@@ -262,6 +263,7 @@ def run_analysis(
             manual_job_texts=[raw_jd],
             use_llm=use_llm,
             use_embedding=use_embedding,
+            session_id=session_id,
         )
     except Exception as exc:  # pragma: no cover - engine-level failure
         logger.exception("Careerly analysis failed: %s", exc)

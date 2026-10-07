@@ -127,8 +127,29 @@ class StateStore:
 
     # ── Session lifecycle ───────────────────────────────────────────────
 
-    def create_session(self, config: dict | None = None, user_id: str | int | None = None) -> str:
+    @staticmethod
+    def new_session_id() -> str:
+        """按本 store 的命名约定生成一个 session id，**不落库**。
+
+        P1-1b：API 层需要「先生成 id、交给引擎、同时写进自己的任务行」这个顺序，
+        故把命名规则单独暴露出来 —— 免得调用方各自拼一个 ``session-`` 前缀，
+        两处格式一旦漂移，绑定就静默失效。
+        """
+        return f"session-{uuid.uuid4().hex[:12]}"
+
+    def create_session(
+        self,
+        config: dict | None = None,
+        user_id: str | int | None = None,
+        session_id: str | None = None,
+    ) -> str:
         """Create a new session and return its ID.
+
+        ``session_id``（P1-1b）—— 调用方指定 id，而不是自动生成。
+        用于把引擎 session 与 Careerly 的 ``analysis_tasks`` 行**预先绑定**：
+        API 层先生成 id 写进任务行，再把它交给引擎，于是运行期间
+        ``GET /analysis/tasks/{id}`` 就能读到本 session 的节点进度。
+        不传则沿用 ``session-<hex>`` 的自动命名（既有调用方零改动）。
 
         架构决策 D-F（2026-09-30 裁决）—— ``user_id`` 的边界：
             持久层（本表）**有** ``user_id``，用于数据归属与用户隔离；
@@ -138,7 +159,7 @@ class StateStore:
             引擎内部 / 离线调用（``scripts/e2e_careerly.py`` 等）不传该参数，
             产生的行为 NULL，对**任何**用户查询均不可见（fail-closed）。
         """
-        session_id = f"session-{uuid.uuid4().hex[:12]}"
+        session_id = session_id or self.new_session_id()
         now = time.time()
         conn = _get_conn(self.db_path)
         conn.execute(
@@ -282,6 +303,27 @@ class StateStore:
             (json.dumps(cfg, ensure_ascii=False), time.time(), session_id),
         )
         conn.commit()
+
+    def get_session_progress(self, session_id: str) -> dict[str, Any]:
+        """Read back what :meth:`update_session_progress` last wrote.
+
+        Returns ``{}`` when the session is unknown, has no ``config_json``,
+        or never reported progress — callers treat that as "排队中/未知",
+        never as "进度为 0%。"
+        """
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT config_json FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if not row or not row["config_json"]:
+            return {}
+        try:
+            cfg = json.loads(row["config_json"])
+        except (TypeError, ValueError):
+            return {}
+        progress = cfg.get("_progress") if isinstance(cfg, dict) else None
+        return progress if isinstance(progress, dict) else {}
 
     def update_session_config(self, session_id: str, config: dict) -> None:
         """Replace the entire session config_json."""

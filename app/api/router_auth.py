@@ -41,9 +41,12 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
+from app.core import account_purge
 from app.core.auth_store import AuthStore
 from app.core.passwords import MIN_PASSWORD_LENGTH, hash_password, verify_password
 from app.core.security import get_current_user, issue_tokens
+from app.utils.logger import logger
+from app.utils.redact import mask_phone
 
 router = APIRouter(prefix="/api/v1")
 
@@ -237,6 +240,20 @@ async def login(req: LoginRequest) -> JSONResponse:
         if not user.get("is_active", 1):
             return _err("ACCOUNT_DISABLED", "账号已停用", 403)
 
+    # ── 已注销账号（决策 D119）───────────────────────────────────────────
+    # 放在两个分支**汇合之后**，位置是刻意的：
+    #
+    # * 必须在这里 —— 软删除不动 ``password_hash``，所以注销后密码照样能
+    #   校验通过。少了这一条，用户在 App 里「删除账号」之后重新登录就能拿到
+    #   一个带**新版本号**的 token，token_version 吊销被整个绕过。
+    # * 必须在密码校验**之后** —— 与上面 is_active 同理：没带对密码的人
+    #   不该能问出「这个号是否已注册且已注销」。
+    #
+    # 401 而非 403：账号已不存在，客户端应当清掉本地凭据回到登录页，
+    # 这与 get_current_user 对已注销账号返回 401 保持一致。
+    if user.get("status") == "deleted":
+        return _err("ACCOUNT_DELETED", "账号已注销", 401)
+
     tokens = issue_tokens(user)
     return _ok({"user": _public_user(user), **tokens})
 
@@ -321,6 +338,17 @@ async def refresh(req: RefreshRequest) -> JSONResponse:
     user = store.get_by_id(int(subject))
     if user is None or not user.get("is_active", 1):
         return _err("INVALID_REFRESH_TOKEN", "User no longer exists or is disabled", 401)
+    # 已注销账号（决策 D119）。下面的版本比对**已经**能拦住它（软删除必然
+    # +1），这里再判一次 status 是冗余的第二道闸：万一将来出现「注销后又
+    # 恢复账号」这类把版本号对齐的路径，凭据也不该复活。
+    if user.get("status") == "deleted":
+        return _err("INVALID_REFRESH_TOKEN", "User no longer exists or is disabled", 401)
+
+    # 吊销比对（决策 D119）—— refresh 必须与 access 同口径。
+    # 少了这一段，用户「删除账号」后旧 refresh 仍能无限换取新 access token，
+    # 吊销就等于没做：access 只有 60 分钟，而 refresh 有 90 天。
+    if int(payload.get("token_version", 0)) != int(user.get("token_version", 0) or 0):
+        return _err("INVALID_REFRESH_TOKEN", "Refresh token has been revoked", 401)
 
     tokens = issue_tokens(user)
     return _ok({
@@ -335,3 +363,94 @@ async def refresh(req: RefreshRequest) -> JSONResponse:
 async def me(current_user: dict = Depends(get_current_user)) -> JSONResponse:
     """Return the currently authenticated user (resolved from Bearer token)."""
     return _ok({"user": _public_user(current_user)})
+
+
+# ── 注销账号（决策 D119 / 发布基线 K19）─────────────────────────────────────
+
+#: 软删除到物理清理之间的窗口（天）。用户视角「马上生效」，数据在窗口内可恢复。
+PURGE_GRACE_DAYS = 30
+
+
+@router.delete("/account/career-data")
+def delete_career_data(
+    current_user: dict = Depends(get_current_user),
+) -> JSONResponse:
+    """删除当前账号的职业数据，但保留账号与当前会话。"""
+    user_id = int(current_user["id"])
+    report = account_purge.purge_user(user_id, dry_run=False)
+
+    warnings: list[str] = []
+    if report.orphan_artifacts:
+        warnings.append("部分历史文件无法确认归属，未被删除。")
+    if any("文件删除失败" in warning for warning in report.warnings):
+        warnings.append("部分职业数据文件删除失败，请联系支持。")
+
+    logger.info(
+        "Career data deleted | id=%d | rows=%d | files=%d | warnings=%d",
+        user_id,
+        report.total_rows,
+        report.total_files,
+        len(warnings),
+    )
+    return _ok(
+        {
+            "deleted": True,
+            "account_retained": True,
+            "deleted_rows": report.total_rows,
+            "deleted_files": report.total_files,
+            "orphan_artifacts": report.orphan_artifacts,
+            "warnings": warnings,
+        }
+    )
+
+
+@router.delete("/account")
+async def delete_account(current_user: dict = Depends(get_current_user)) -> JSONResponse:
+    """注销当前账号 —— **软删除 + 立即吊销全部凭据**。
+
+    为什么不做物理删除
+    ------------------
+    用户数据散在四个 SQLite 库 + 三类落盘文件里，没有外键把它们连起来
+    （见 ``app/core/account_purge.py`` 的清单）。当场做级联删除有两个问题：
+    中途失败会留下**比不删更难处理**的半删状态；而用户已经看到「删除成功」了。
+
+    所以拆成两步：
+
+    ```text
+    现在       status='deleted' + deleted_at + token_version += 1
+               → 用户视角立刻生效（旧 token 下一次请求就失效）
+    30 天后    scripts/purge_deleted_accounts.py 离线做物理级联
+               → 那时失败可以重跑，且窗口期内误删可恢复
+    ```
+
+    ⚠️ ``token_version += 1`` 与 ``status='deleted'`` 必须在**同一次提交**里
+    （见 ``AuthStore.soft_delete_user``）：只标记不吊销，用户在 90 天 refresh
+    有效期内还能继续访问；只吊销不标记，30 天后的清理任务找不到这个账号。
+
+    与 Google Play 的关系：政策要求 App 内提供账号删除入口，且删除请求
+    必须同时覆盖账号与关联数据 —— 后者由 30 天清理任务承担，其范围见
+    ``account_purge`` 的实测报告。
+    """
+    store = AuthStore()
+    user_id = int(current_user["id"])
+
+    if not store.soft_delete_user(user_id):
+        # 已经是 deleted 状态。这里返回 409 而不是假装成功：重复调用不该
+        # 被当成「又一次成功删除」，否则客户端无从判断自己是不是第一个删的。
+        return _err("ACCOUNT_ALREADY_DELETED", "账号已注销", 409)
+
+    # 手机号必须脱敏（K21）—— 注销日志同样不该留明文联系方式。
+    logger.info(
+        "Account deleted（软删除）| id=%d | phone=%s | 物理清理将在 %d 天后",
+        user_id,
+        mask_phone(current_user.get("phone")),
+        PURGE_GRACE_DAYS,
+    )
+
+    return _ok(
+        {
+            "deleted": True,
+            "purge_after_days": PURGE_GRACE_DAYS,
+            "purge_after_ts": time.time() + PURGE_GRACE_DAYS * 86400,
+        }
+    )

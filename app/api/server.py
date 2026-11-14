@@ -9,7 +9,6 @@ Provides a production-grade HTTP API wrapping the LangGraph pipeline.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any, Optional
 
 import time
@@ -32,6 +31,7 @@ from app.core.orchestrator import DecisionGraph
 from app.core.security import get_current_user
 from app.core.state_store import StateStore
 from app.utils.logger import logger
+from app.utils.paths import APP_DATA_DIR, DATA_ROOT, ROOT_DATA_DIR, TESSDATA_DIR
 
 # ── 认证边界自检（决策 D-NEW 方案 A / P0-6）──────────────────────────────────
 # 必须在创建 app 之前执行：ENV=production + AUTH_MODE=dev → **拒绝启动**。
@@ -39,6 +39,23 @@ from app.utils.logger import logger
 # 告警拦不住、而这行 raise 能拦住的那类决定。
 assert_auth_configuration_is_safe()
 logger.info("Auth boundary | %s", auth_mode_banner())
+
+# ── 数据根自检 ────────────────────────────────────────────────────────────────
+# 未设 DATA_DIR/RAILWAY_VOLUME_MOUNT_PATH 时 DATA_ROOT 为 None，此时两棵树在
+# 仓库内（ECS 上的正常形态，见 docs/09_Release/DEPLOY_ECS.md §3）。
+# 打这一条是为了让 §5 那种 `journalctl | grep` 式自检也能确认数据落点 ——
+# 「库写到了别处」是部署后最难发现的一类问题。
+if DATA_ROOT is None:
+    logger.info(
+        "Data root | (未配置) app=%s | root=%s | tessdata=%s",
+        APP_DATA_DIR, ROOT_DATA_DIR, TESSDATA_DIR,
+    )
+else:
+    logger.info(
+        "Data root | %s (来自 DATA_DIR/RAILWAY_VOLUME_MOUNT_PATH) "
+        "| app=%s | root=%s | tessdata=%s (固定锚定仓库)",
+        DATA_ROOT, APP_DATA_DIR, ROOT_DATA_DIR, TESSDATA_DIR,
+    )
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
@@ -392,7 +409,7 @@ async def download_report(
     if not get_store().get_session_info(session_id, user_id=str(current_user["id"])):
         raise ResourceNotFound(f"Session {session_id} not found")
 
-    output_dir = Path(__file__).resolve().parent.parent.parent / "data" / "outputs"
+    output_dir = ROOT_DATA_DIR / "outputs"
     report_file = output_dir / f"report_{session_id}.{fmt}"
 
     if not report_file.exists():

@@ -13,10 +13,13 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
+# 路径基准统一由 app.utils.paths 提供（见该模块文档：为什么不在 app/core/）。
+# REPO_ROOT 随代码走；APP_DATA_DIR 可被 DATA_DIR 重定向到数据盘。
+from app.utils.paths import APP_DATA_DIR, REPO_ROOT
+
 load_dotenv()
 
-ROOT_DIR = Path(__file__).resolve().parent.parent.parent
-CONFIG_YAML_PATH = ROOT_DIR / "config.yaml"
+CONFIG_YAML_PATH = REPO_ROOT / "config.yaml"
 
 
 # ── YAML loader ──────────────────────────────────────────────────────────────
@@ -143,8 +146,10 @@ class AppConfig(BaseModel):
     matching: MatchingConfig = Field(default_factory=MatchingConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
     debug: bool = Field(default_factory=lambda: os.getenv("DEBUG", "false").lower() == "true")
-    data_dir: Path = ROOT_DIR / "app" / "data"
-    output_dir: Path = ROOT_DIR / "app" / "data" / "outputs"
+    # 用 default_factory 而非模块级常量求值：config 单例可能在 DATA_DIR 尚未
+    # 生效的时序下被构造，工厂形式可保证拿到 paths 模块的最终值。
+    data_dir: Path = Field(default_factory=lambda: APP_DATA_DIR)
+    output_dir: Path = Field(default_factory=lambda: APP_DATA_DIR / "outputs")
 
     model_config = {"frozen": False}
 

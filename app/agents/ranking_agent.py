@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from pathlib import Path
 from typing import Optional
 
 from app.models.job import JobList
@@ -12,8 +11,8 @@ from app.models.match import MatchReport, MatchResult
 from app.models.resume import ResumeProfile
 from app.services.export_service import ExportService
 from app.utils.logger import logger
+from app.utils.paths import APP_DATA_DIR as DATA_DIR  # 可被 DATA_DIR 重定向
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 OUTPUT_DIR = DATA_DIR / "outputs"
 
 

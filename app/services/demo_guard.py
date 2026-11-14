@@ -29,8 +29,10 @@ from typing import Any, Optional
 import aiosqlite
 
 from app.utils.logger import logger
+# ⚠️ 这里的 graph_state.db 是 DemoGuard 的试用计数，与引擎的
+# app/data/graph_state.db **同名不同文件** —— 必须锚定遗留的 <root>/data 树。
+from app.utils.paths import ROOT_DATA_DIR as DATA_DIR
 
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
 DB_PATH = DATA_DIR / "graph_state.db"
 
 # ── Environment ─────────────────────────────────────────────────────────────

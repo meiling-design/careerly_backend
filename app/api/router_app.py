@@ -48,6 +48,7 @@ from app.agents.resume_agent import ResumeAgent
 from app.core.security import get_current_user
 from app.core.state_store import StateStore
 from app.utils.logger import logger
+from app.utils.paths import ROOT_DATA_DIR
 from app.utils.redact import mask_filename
 
 # ── Router ──────────────────────────────────────────────────────────────────
@@ -56,7 +57,7 @@ router = APIRouter(prefix="/api/v1")
 
 # ── File storage paths ──────────────────────────────────────────────────────
 
-_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+_DATA_DIR = ROOT_DATA_DIR  # 遗留 <root>/data 树，可被 DATA_DIR 重定向
 _UPLOAD_DIR = _DATA_DIR / "uploads"
 _RESUME_DIR = _DATA_DIR / "resumes"
 _MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB

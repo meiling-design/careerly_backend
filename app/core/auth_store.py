@@ -44,9 +44,9 @@ from pathlib import Path
 from typing import Any
 
 from app.utils.logger import logger
+from app.utils.paths import APP_DATA_DIR as DATA_DIR  # 可被 DATA_DIR 重定向
 from app.utils.redact import mask_phone
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DB_PATH = DATA_DIR / "auth.db"
 
 # Thread-local connections for async safety (separate slot from StateStore)
@@ -272,6 +272,27 @@ class AuthStore:
         if row is None:
             return None
         return row["password_hash"]
+
+    def set_password_hash(self, user_id: int, password_hash: str) -> int:
+        """Replace the account's password hash **and revoke existing tokens**.
+
+        密码重置必须与吊销在同一条 SQL 里完成：只换哈希的话，重置前签发的
+        access / refresh token 仍然有效，等于「旧设备还能继续用旧会话」——
+        用户以为重置已经把别人踢下线，实际没有。
+        返回新的 ``token_version``，语义同 :meth:`bump_token_version`。
+        """
+        conn = _get_conn(self.db_path)
+        conn.execute(
+            "UPDATE users "
+            "SET password_hash = ?, token_version = token_version + 1, updated_at = ? "
+            "WHERE id = ?",
+            (password_hash, time.time(), user_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT token_version FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return int(row["token_version"]) if row else 0
 
     # ── Uniqueness checks ───────────────────────────────────────────────
 

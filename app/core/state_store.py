@@ -23,8 +23,10 @@ from app.models.job import JobList, JobPosting
 from app.models.match import MatchResult
 from app.models.resume import ResumeProfile
 from app.utils.logger import logger
+# 数据根由 app.utils.paths 统一给出（可被 DATA_DIR 重定向到数据盘）。
+# 本地名保持 DATA_DIR —— 测试靠 monkeypatch.setattr(模块, "DATA_DIR"/"DB_PATH", …) 隔离。
+from app.utils.paths import APP_DATA_DIR as DATA_DIR
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DB_PATH = DATA_DIR / "graph_state.db"
 
 # Thread-local connections for async safety

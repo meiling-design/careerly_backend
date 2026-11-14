@@ -27,9 +27,9 @@ from typing import Optional
 from app.models.resume import Education, Project, ResumeProfile
 from app.services.llm_service import LLMService
 from app.utils.logger import logger
+from app.utils.paths import APP_DATA_DIR as DATA_DIR, TESSDATA_DIR
 from app.utils.redact import mask_name
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 RESUME_OUTPUT_DIR = DATA_DIR / "outputs"
 
 # ── OCR 环境 ────────────────────────────────────────────────────────────────
@@ -47,7 +47,13 @@ _TESSERACT_CANDIDATES = (
 )
 
 #: 随仓库携带的 tessdata（`chi_sim` 不在 stock 安装包里，见 app/data/tessdata/README.md）。
-_LOCAL_TESSDATA = DATA_DIR / "tessdata"
+#:
+#: ⚠️ 注意这一行**不**跟随上面的 DATA_DIR（本文件里唯一如此的地方）：
+#: tessdata 是随代码仓发布的**只读资源**，不是用户数据。若跟着 DATA_DIR 落到
+#: 运行时才挂载、初始为空的数据盘上，下面 _apply_tessdata() 的存在性检查会
+#: **静默失败**、不设 TESSDATA_PREFIX，OCR 悄悄退回默认语言包 —— 正是不远处的
+#: 注释明令禁止的"失败无痕"。
+_LOCAL_TESSDATA = TESSDATA_DIR
 
 
 class ResumeExtractionError(RuntimeError):

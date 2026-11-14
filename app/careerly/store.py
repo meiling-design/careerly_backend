@@ -35,8 +35,8 @@ from app.careerly.schemas import (
     iso,
 )
 from app.utils.logger import logger
+from app.utils.paths import APP_DATA_DIR as DATA_DIR  # 可被 DATA_DIR 重定向
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DB_PATH = DATA_DIR / "careerly.db"
 
 _local = threading.local()

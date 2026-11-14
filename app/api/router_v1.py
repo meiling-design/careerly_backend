@@ -39,7 +39,6 @@ import hashlib
 import json as _json
 import os
 import time
-from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -51,6 +50,7 @@ from app.core.security import get_current_user
 from app.core.state_store import StateStore
 from app.services.demo_guard import DemoGuard
 from app.utils.logger import logger
+from app.utils.paths import ROOT_DATA_DIR
 
 # ── Router ──────────────────────────────────────────────────────────────────
 
@@ -757,7 +757,7 @@ async def download_report(
     if not get_store().get_session_info(session_id, user_id=str(current_user["id"])):
         return _err("NOT_FOUND", f"Session {session_id} not found", 404)
 
-    output_dir = Path(__file__).resolve().parent.parent.parent / "data" / "outputs"
+    output_dir = ROOT_DATA_DIR / "outputs"
     report_file = output_dir / f"report_{session_id}.{fmt}"
 
     if not report_file.exists():

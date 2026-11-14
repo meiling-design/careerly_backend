@@ -48,14 +48,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-# ── 路径 ───────────────────────────────────────────────────────────────────
-# 全部按**仓库根**推导，不依赖 cwd（脚本可从任意目录调用）。
-_ROOT = Path(__file__).resolve().parent.parent.parent  # work_agent/
+from app.utils import paths
+from app.utils.paths import APP_DATA_DIR, ROOT_DATA_DIR
 
-AUTH_DB = _ROOT / "app" / "data" / "auth.db"
-CAREERLY_DB = _ROOT / "app" / "data" / "careerly.db"
-ENGINE_DB = _ROOT / "app" / "data" / "graph_state.db"
-DEMO_DB = _ROOT / "data" / "graph_state.db"
+# ── 路径 ───────────────────────────────────────────────────────────────────
+# 由 app.utils.paths 统一给出，不依赖 cwd（脚本可从任意目录调用），
+# 且可被 DATA_DIR 重定向到数据盘。
+#
+# ⚠️ 两个 graph_state.db **同名不同文件**，必须分别锚定两棵树：
+#   app/data/graph_state.db ← 引擎会话轨迹（APP_DATA_DIR）
+#   data/graph_state.db     ← DemoGuard 试用计数（ROOT_DATA_DIR）
+# 合并成一个基准会串数据。
+AUTH_DB = APP_DATA_DIR / "auth.db"
+CAREERLY_DB = APP_DATA_DIR / "careerly.db"
+ENGINE_DB = APP_DATA_DIR / "graph_state.db"
+DEMO_DB = ROOT_DATA_DIR / "graph_state.db"
 
 # 产物目录。⚠️ 这些路径在不同调用点**并不一致**（见下方说明），
 # 因此这里把「实际存在」的都列出来，逐个扫，漏一个就等于漏一份 PII。
@@ -66,12 +73,12 @@ DEMO_DB = _ROOT / "data" / "graph_state.db"
 #   app/api/router_v1.py:760   → data/outputs       ← 不存在，读不到文件
 #   app/api/server.py:395      → data/outputs       ← 同上
 ARTIFACT_DIRS = (
-    _ROOT / "app" / "data" / "outputs",   # 真正有内容的目录
-    _ROOT / "data" / "outputs",           # 部分调用点以为的目录
-    _ROOT / "app" / "data" / "resumes",
-    _ROOT / "data" / "resumes",
-    _ROOT / "app" / "data" / "uploads",
-    _ROOT / "data" / "uploads",
+    APP_DATA_DIR / "outputs",   # 真正有内容的目录
+    ROOT_DATA_DIR / "outputs",  # 部分调用点以为的目录
+    APP_DATA_DIR / "resumes",
+    ROOT_DATA_DIR / "resumes",
+    APP_DATA_DIR / "uploads",
+    ROOT_DATA_DIR / "uploads",
 )
 
 # ``careerly.db`` 中直接带 ``user_id`` 的表（删起来没有歧义）。
@@ -360,7 +367,10 @@ def _purge_files(
     for directory in ARTIFACT_DIRS:
         if not directory.is_dir():
             continue
-        label = directory.relative_to(_ROOT).as_posix()
+        # 用 paths.label_for 而非 relative_to(_ROOT)：数据根配到数据盘后，
+        # 这些目录已在仓库树之外，直接 relative_to 会 ValueError。
+        # 它前面有 is_dir() 守卫 —— 恰恰在生产数据齐全时才走到 → 删账号 500。
+        label = paths.label_for(directory)
         hits = [
             entry
             for entry in directory.iterdir()

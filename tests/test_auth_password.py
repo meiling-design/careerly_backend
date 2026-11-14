@@ -347,3 +347,72 @@ def test_oauth_requires_a_code(client: TestClient) -> None:
     """空 body / 空 code → 422（在到达渠道判断之前就被 pydantic 拦下）。"""
     r = client.post(OAUTH.format(provider="wechat"), json={})
     assert r.status_code == 422, r.text
+
+
+# ── 5. 密码重置（DEV-only，2026-11-13） ────────────────────────────────────
+
+RESET = "/api/v1/auth/reset-password"
+
+
+def test_dev_password_reset_changes_password_and_revokes_old_tokens(
+    client: TestClient,
+) -> None:
+    """DEV 模式下凭手机号重置；旧密码、旧 token 都必须立即失效。
+
+    仅改哈希是不够的：重置前签发的 token 若还能用，等于「把人踢下线」
+    这件事没发生。``set_password_hash`` 在同一事务里 bump token_version。
+    """
+    r = _register(client, "13800000021", "重置一", "oldpass1")
+    assert r.status_code == 201, r.text
+    old_token = r.json()["data"]["access_token"]
+
+    r = client.post(RESET, json={"phone": "13800000021", "new_password": "newpass1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["reset"] is True
+
+    # 旧 token → 401（token_version 已变）
+    r = client.get(ME, headers={"Authorization": f"Bearer {old_token}"})
+    assert r.status_code == 401, r.text
+
+    # 旧密码 → 401；新密码 → 200
+    r = client.post(LOGIN, json={"phone": "13800000021", "password": "oldpass1"})
+    assert r.status_code == 401, r.text
+    r = client.post(LOGIN, json={"phone": "13800000021", "password": "newpass1"})
+    assert r.status_code == 200, r.text
+
+
+def test_password_reset_is_blocked_in_formal_mode(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """正式形态一律 501，且**已注册与未注册手机号回答一致**。
+
+    密码找回需要独立验证通道；在它上线前，正式部署不得开放「知道手机号
+    就能改密码」的入口，也不得借此探测手机号是否注册。
+    """
+    _register(client, "13800000022", "重置二", "secret66")
+    monkeypatch.setenv("AUTH_MODE", "formal")
+
+    registered = client.post(
+        RESET, json={"phone": "13800000022", "new_password": "newpass1"}
+    )
+    unregistered = client.post(
+        RESET, json={"phone": "13900000022", "new_password": "newpass1"}
+    )
+
+    for response in (registered, unregistered):
+        assert response.status_code == 501, response.text
+        assert response.json()["error"]["code"] == "PASSWORD_RESET_UNAVAILABLE"
+
+
+def test_password_reset_reports_unregistered_phone_under_dev(client: TestClient) -> None:
+    """DEV 形态下与登录一致：未注册手机号 → 401 PHONE_NOT_REGISTERED。"""
+    r = client.post(RESET, json={"phone": "13900000123", "new_password": "newpass1"})
+    assert r.status_code == 401, r.text
+    assert r.json()["error"]["code"] == "PHONE_NOT_REGISTERED"
+
+
+def test_password_reset_rejects_short_new_password(client: TestClient) -> None:
+    """新密码下界与注册一致（6 位），不足 → 422。"""
+    _register(client, "13800000023", "重置三", "secret66")
+    r = client.post(RESET, json={"phone": "13800000023", "new_password": "12345"})
+    assert r.status_code == 422, r.text

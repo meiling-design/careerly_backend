@@ -25,6 +25,7 @@ from app.core.orchestrator import DecisionGraph
 from app.models.job import JobSource
 from app.models.match import MatchReport, MatchResult
 from app.utils.logger import logger
+from app.utils.paths import APP_DATA_DIR  # 数据根可被 DATA_DIR 重定向
 
 # ── 页面配置 ─────────────────────────────────────────────────────────────
 
@@ -256,7 +257,7 @@ def render_main(config: dict) -> None:
         file_path = None
         resume_text_arg = None
         if config["uploaded_file"]:
-            upload_dir = Path(__file__).resolve().parent.parent / "data" / "uploads"
+            upload_dir = APP_DATA_DIR / "uploads"
             upload_dir.mkdir(parents=True, exist_ok=True)
             file_path = str(upload_dir / config["uploaded_file"].name)
             with open(file_path, "wb") as f:
@@ -447,7 +448,7 @@ def render_results(report: MatchReport, graph_state: Any) -> None:
     st.subheader("📥 导出结果")
 
     col1, col2 = st.columns(2)
-    export_path = Path(__file__).resolve().parent.parent / "data" / "outputs"
+    export_path = APP_DATA_DIR / "outputs"
     session_id = st.session_state.state.session_id or "latest"
     report_file = export_path / f"report_{session_id}"
 

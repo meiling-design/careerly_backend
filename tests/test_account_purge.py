@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from app.core import account_purge
+from app.utils import paths
 
 # 被测的两张表都用 TEXT 主键（业务 id 形如 proj-xxx），插入时给足列。
 _USER = 1
@@ -212,7 +213,10 @@ def test_reports_unattributable_artifacts(sandbox, monkeypatch: pytest.MonkeyPat
     outputs = sandbox["CAREERLY_DB"].parent / "outputs"
     outputs.mkdir()
     (outputs / "report_session-someone-else.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(account_purge, "_ROOT", sandbox["CAREERLY_DB"].parent)
+    # 标签的基准已从模块内的 _ROOT 收敛到 app.utils.paths.DATA_ROOT
+    # （label_for 在调用时读它），因此这里改 patch 后者 —— 保持本用例
+    # 覆盖「相对标签」那条分支，而不是退化成绝对路径兜底。
+    monkeypatch.setattr(paths, "DATA_ROOT", sandbox["CAREERLY_DB"].parent)
     monkeypatch.setattr(account_purge, "ARTIFACT_DIRS", (outputs,))
 
     report = account_purge.purge_user(_USER, dry_run=False)

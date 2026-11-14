@@ -124,6 +124,36 @@ data/resumes/  data/uploads/
 报告数量）。上线前需要产品侧定一个口径：要么今后的产物文件名带上 `user_id`，
 要么给产物定一个保留期。已记入 `TODO.md`。
 
+### 3.1 可选：用 `DATA_DIR` 把数据移出仓库
+
+上面「把数据盘挂到 `/opt/careerly`（或做软链）」是**默认做法，零代码改动**，
+在 ECS 上已经够用 —— 持久 VM 上仓库内落盘不会丢。本节是个**可选的替代方案**，
+只在你想把「代码」和「数据」物理分开挂载时使用（例如代码放系统盘、
+`/data` 单独一块盘）。
+
+```bash
+# /etc/careerly/backend.env
+DATA_DIR=/data/careerly
+```
+
+两棵树原样搬过去，文件名与子目录一概不变：
+
+```text
+/data/careerly/app/    ← 原 <仓库>/app/data/
+/data/careerly/root/   ← 原 <仓库>/data/
+```
+
+三条必须知道的事：
+
+| | 说明 |
+|---|---|
+| **不是硬性配置** | `DATA_DIR` **不在** §1 的四条之内。不设它进程照常启动，两棵树留在仓库内 —— 这正是「生产上不设这个变量就等于回滚」的由来。 |
+| **必须写绝对路径** | 相对路径按进程 cwd 解析；systemd 下即 `WorkingDirectory=/opt/careerly/work_agent`，容易与预期不符。 |
+| **tessdata 不跟随** | `app/data/tessdata/`（OCR 中文语言包）**始终**锚定仓库路径。跟到空的数据盘上会让中文简历 OCR **静默**退化成默认语言包（不报错、只出乱码/空文本）。 |
+
+迁移时旧数据要**手动搬**（首次设置 `DATA_DIR` 时，把上述目录 cp 到新位置再启动）——
+`DATA_DIR` 只改落点，不做数据搬迁。
+
 ---
 
 ## 4. 备份
@@ -149,6 +179,12 @@ scripts/backup_sqlite.sh
 systemctl is-active careerly-api
 journalctl -u careerly-api | grep "Auth boundary"
 #   → 应看到 AUTH MODE = FORMAL | ENV = production
+
+# 数据实际落到哪里（§3.1 设了 DATA_DIR 时尤其要看）
+journalctl -u careerly-api | grep "Data root"
+#   未设 DATA_DIR → "Data root | (未配置) app=…/app/data | root=…/data"
+#   设了         → "Data root | /data/careerly (来自 …) | app=/data/careerly/app | …"
+#   两个路径都应为**已挂载的数据盘**，且 tessdata 始终指向仓库内路径。
 
 # 缺配置确实起不来（在**测试机**上验证，别在生产上试）
 sudo systemctl stop careerly-api

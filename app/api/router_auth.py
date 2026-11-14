@@ -3,8 +3,9 @@
 Identity model
 --------------
 ```text
-register   name(必填) · phone(必填) · password(选填*) · email(选填)
-login      phone(必填) · password(选填*)
+register       name(必填) · phone(必填) · password(选填*) · email(选填)
+login          phone(必填) · password(选填*)
+reset-password phone(必填) · new_password(必填, >= 6)   ← 仅 DEV 模式
 ```
 
 The account identity is the **phone number**. Since 2026-10-04 a **password**
@@ -126,6 +127,24 @@ class LoginRequest(BaseModel):
     phone: str = Field(..., min_length=5, max_length=20)
     password: Optional[str] = Field(
         None, max_length=_MAX_PASSWORD_LENGTH, description="密码（有密码的账号必填）"
+    )
+
+
+class ResetPasswordRequest(BaseModel):
+    """POST /auth/reset-password body（仅 DEV 模式可用）。
+
+    ⚠️ 这是**开发联调**通道，不是正式找回流程：DEV 模式下手机号本身
+    就是可直登的凭据（见 ``app.core.auth_mode``），因此允许凭手机号重置密码
+    并不额外降低安全性。生产形态（``AUTH_MODE=formal``）一律 501 ——
+    正式找回需要短信 / 邮箱验证码，属独立的 P5 通道。
+    """
+
+    phone: str = Field(..., min_length=5, max_length=20, description="手机号，账号身份")
+    new_password: str = Field(
+        ...,
+        min_length=MIN_PASSWORD_LENGTH,
+        max_length=_MAX_PASSWORD_LENGTH,
+        description="新密码（>= 6 位）",
     )
 
 
@@ -256,6 +275,57 @@ async def login(req: LoginRequest) -> JSONResponse:
 
     tokens = issue_tokens(user)
     return _ok({"user": _public_user(user), **tokens})
+
+
+@router.post("/auth/reset-password")
+async def reset_password(req: ResetPasswordRequest) -> JSONResponse:
+    """DEV-only password reset: phone + new password, no OTP.
+
+    背景：App 的「忘记密码?」此前是死链（Figma 没给 onClick，后端也没有
+    端点）。2026-11-13 产品侧要求补齐，并选定「DEV 模式手机号直重置」——
+    当前没有短信 / 邮件服务，密码是 bcrypt 哈希无法找回，只能重置。
+
+    ```text
+    AUTH_MODE=dev     凭手机号即可重置（与 DEV 直登同一条信任边界）
+    AUTH_MODE=formal  501 PASSWORD_RESET_UNAVAILABLE（不泄露手机号是否存在）
+    ```
+
+    ⚠️ **不是正式找回通道**。生产变体需要短信 / 邮箱验证码，属 P5。
+    把本端点当成生产可用的找回手段是错的 —— ``auth_mode`` 的 fail-fast
+    与这里的门禁共同保证它不会在 ``ENV=production`` 下被走到。
+
+    重置成功会通过 :meth:`AuthStore.set_password_hash` **同时吊销全部旧令牌**，
+    因此旧设备上的会话立即失效。
+    """
+    from app.core.auth_mode import is_dev_auth
+
+    # 先做模式门禁、再查账号 —— 与 login 的分支顺序同理：
+    # 正式形态下探测任意手机号都应得到同一个 501。
+    if not is_dev_auth():
+        return _err(
+            "PASSWORD_RESET_UNAVAILABLE",
+            "密码找回当前仅在开发模式可用；正式找回通道尚未上线",
+            501,
+        )
+
+    store = AuthStore()
+    phone = req.phone.strip()
+    user = store.get_by_phone(phone)
+    if user is None:
+        return _err("PHONE_NOT_REGISTERED", "该手机号尚未注册", 401)
+    if not user.get("is_active", 1):
+        return _err("ACCOUNT_DISABLED", "账号已停用", 403)
+    if user.get("status") == "deleted":
+        return _err("ACCOUNT_DELETED", "账号已注销", 401)
+
+    # 明文在离开本函数前被哈希；日志只记录脱敏手机号。
+    store.set_password_hash(user["id"], hash_password(req.new_password))
+    logger.info(
+        "AuthStore: password reset | id=%d | phone=%s",
+        user["id"],
+        mask_phone(phone),
+    )
+    return _ok({"reset": True})
 
 
 # ── Third-party sign-in（可配置契约） ────────────────────────────────────────

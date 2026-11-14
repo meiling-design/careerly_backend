@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from pathlib import Path
 from typing import Optional
 
 from app.models.job import JobList, JobPosting
@@ -20,8 +19,8 @@ from app.models.resume import ResumeProfile
 from app.services.embedding_service import EmbeddingService
 from app.services.llm_service import LLMService
 from app.utils.logger import logger
+from app.utils.paths import APP_DATA_DIR as DATA_DIR  # 可被 DATA_DIR 重定向
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 MATCH_OUTPUT_DIR = DATA_DIR / "outputs"
 
 

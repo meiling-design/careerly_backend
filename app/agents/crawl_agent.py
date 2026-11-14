@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from pathlib import Path
 from typing import Optional
 
 from app.agents.adapters import get_adapter_for_url
@@ -26,8 +25,8 @@ from app.models.job import JobList, JobSource
 from app.services.llm_service import LLMService
 from app.utils.helpers import validate_url
 from app.utils.logger import logger
+from app.utils.paths import APP_DATA_DIR as DATA_DIR  # 可被 DATA_DIR 重定向
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CRAWL_OUTPUT_DIR = DATA_DIR / "outputs"
 
 

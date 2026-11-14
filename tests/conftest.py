@@ -15,8 +15,13 @@ from typing import Any, Optional
 import pytest
 
 # Point data dir to a temp location during tests
+#
+# 这行**不能删**：删了默认就落回真实的开发库 app/data/*.db，测试会污染本地数据。
+# 目录名沿用 tests/.tmp_* 前缀 —— `.gitignore` 用通配覆盖了这一族
+# （`tests/.tmp_p1/`、`tests/.tmp_engine/` 这类逐条枚举的写法漏过文件，
+# 见 G0-2）。归到同一个前缀下，今后新增测试临时目录无需再改 .gitignore。
 os.environ.setdefault("DEBUG", "true")
-os.environ.setdefault("DATA_DIR", str(Path(__file__).resolve().parent / "test_data"))
+os.environ.setdefault("DATA_DIR", str(Path(__file__).resolve().parent / ".tmp_data_root"))
 
 from app.models.job import JobList, JobPosting, JobSource
 from app.models.match import MatchResult, SkillGap

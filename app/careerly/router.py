@@ -36,6 +36,8 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import threading
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -55,13 +57,15 @@ from app.careerly.ai_context import (
     build_current_context,
     build_user_prompt,
 )
-from app.careerly.engine import AnalysisError, run_analysis
+from app.careerly.engine import AnalysisCancelled, AnalysisError, run_analysis
 from app.careerly.job_import import JobImportError, fetch_job_from_url
 from app.careerly.schemas import (
     AiMessageRequest,
     AnalyzeRequest,
+    JobSnapshot,
     ParseJobUrlRequest,
     dump,
+    iso,
 )
 from app.careerly.store import CareerlyStore
 from app.services.llm_service import LLMService
@@ -78,6 +82,22 @@ def get_store() -> CareerlyStore:
     if _store is None:
         _store = CareerlyStore()
     return _store
+
+
+def recover_interrupted_tasks() -> int:
+    """应用启动时清理遗留的 ``queued`` / ``processing`` 任务（P1-06）。
+
+    由 ``app/api/server.py`` 的 startup 钩子调用。**不重新执行**分析 ——
+    协程无法跨进程恢复，重跑没有可靠依据，而且可能重复扣费。
+    只保证状态正确：``failed`` + ``TASK_INTERRUPTED`` + 释放额度预占。
+    """
+    try:
+        recovered = get_store().recover_interrupted_tasks()
+        logger.info("Careerly startup recovery | interrupted=%d", recovered)
+        return recovered
+    except Exception:  # pragma: no cover - startup must not crash the app
+        logger.exception("Careerly startup recovery failed")
+        return 0
 
 
 _engine_store: StateStore | None = None
@@ -127,40 +147,224 @@ _NODE_TO_STEP: dict[str, int] = {
 #: 不要拿它去除以 ``totalSteps``。
 ENGINE_NODE_COUNT = 8
 
+#: 每个产品步骤「完成」所依据的引擎节点。
+#: ``recrawl`` 是 step 2 的内部回环，不参与完成判定 —— 否则一次回环会把
+#: 已经完成的步骤重新算成未完成。
+STEP_NODES: tuple[tuple[str, ...], ...] = (
+    ("crawl", "normalize"),
+    ("resume_embed",),
+    ("routing", "match"),
+    ("rank",),
+    ("report",),
+)
 
-def _progress_payload(session_id: str | None) -> dict[str, Any] | None:
+#: 阶段权重。与 Figma ``analysisBeats.endPercent`` 的相邻差值一致：
+#: ``[20, 40, 75, 90, 100]`` → ``[20, 20, 35, 15, 10]``。
+#: 总进度只在这里加权，客户端不自行猜权重。
+STEP_WEIGHTS: tuple[int, ...] = (20, 20, 35, 15, 10)
+
+STEP_STATUS_COMPLETED = "completed"
+STEP_STATUS_RUNNING = "running"
+STEP_STATUS_PENDING = "pending"
+STEP_STATUS_FAILED = "failed"
+STEP_STATUS_CANCELLED = "cancelled"
+
+
+def _build_steps(
+    *,
+    task_status: str,
+    node: str | None,
+    node_status: str | None,
+    completed_nodes: set[str],
+    error_message: str | None,
+) -> list[dict[str, Any]]:
+    """把引擎节点状态翻译成 5 个产品步骤的**显式状态**。
+
+    状态只从真实节点推导，不做任何时间估算：
+
+    - ``completed_nodes`` 覆盖了某步的全部节点 → completed
+    - 当前节点属于某步且尚未完成 → running
+    - 任务 failed/cancelled → 当前步标红，其后 pending
+    - 其余 → pending
+    """
+    statuses: list[str] = [STEP_STATUS_PENDING] * ANALYSIS_STEP_COUNT
+
+    if task_status == CareerlyStore.TASK_COMPLETED:
+        statuses = [STEP_STATUS_COMPLETED] * ANALYSIS_STEP_COUNT
+    elif task_status in (
+        CareerlyStore.TASK_FAILED,
+        CareerlyStore.TASK_CANCELLED,
+    ):
+        failed_step = _NODE_TO_STEP.get(node) if isinstance(node, str) else None
+        if failed_step is not None:
+            for i in range(ANALYSIS_STEP_COUNT):
+                if i < failed_step:
+                    statuses[i] = STEP_STATUS_COMPLETED
+                elif i == failed_step:
+                    statuses[i] = (
+                        STEP_STATUS_CANCELLED
+                        if task_status == CareerlyStore.TASK_CANCELLED
+                        else STEP_STATUS_FAILED
+                    )
+    else:
+        for i, nodes in enumerate(STEP_NODES):
+            if nodes and all(n in completed_nodes for n in nodes):
+                statuses[i] = STEP_STATUS_COMPLETED
+            elif isinstance(node, str) and node in nodes:
+                statuses[i] = (
+                    STEP_STATUS_FAILED
+                    if node_status == "failed"
+                    else STEP_STATUS_RUNNING
+                )
+        # 失败若发生在尚未落完成集合的节点上，仍按「当前节点所在步」标红。
+        if node_status == "failed" and isinstance(node, str):
+            failed_step = _NODE_TO_STEP.get(node)
+            if failed_step is not None:
+                for i in range(ANALYSIS_STEP_COUNT):
+                    if i < failed_step:
+                        statuses[i] = STEP_STATUS_COMPLETED
+                    elif i == failed_step:
+                        statuses[i] = STEP_STATUS_FAILED
+
+    steps: list[dict[str, Any]] = []
+    for i, status in enumerate(statuses):
+        expected = STEP_NODES[i]
+        done = sum(1 for n in expected if n in completed_nodes)
+
+        # 步内百分比只在**能真实算出来**时给出：该步有多个节点且已完成
+        # 其中一部分。单节点步骤（LLM 生成中）无法精确预估 → ``None``，
+        # 客户端展示不确定态动画，**不允许**用本地时钟补一个假数字。
+        progress_percent: int | None = None
+        if status == STEP_STATUS_COMPLETED:
+            progress_percent = 100
+        elif status == STEP_STATUS_RUNNING and len(expected) > 1:
+            if 0 < done < len(expected):
+                progress_percent = round(done / len(expected) * 100)
+
+        steps.append({
+            "index": i,
+            "status": status,
+            "progressPercent": progress_percent,
+            "error": (
+                error_message
+                if status in (STEP_STATUS_FAILED, STEP_STATUS_CANCELLED)
+                else None
+            ),
+        })
+    return steps
+
+
+def _overall_progress(steps: list[dict[str, Any]], task_status: str) -> int:
+    """按阶段权重汇总总进度。
+
+    - 只有**全部 5 步 completed** 且任务 completed 才允许 100%
+    - 其余情况封顶 99%，保证「完成前永不到 100」
+    - 进行中的步若有真实步内百分比，按权重线性计入（不是匀速自增）
+    """
+    if task_status == CareerlyStore.TASK_COMPLETED and all(
+        s["status"] == STEP_STATUS_COMPLETED for s in steps
+    ):
+        return 100
+
+    total = 0.0
+    for step in steps:
+        weight = STEP_WEIGHTS[step["index"]]
+        if step["status"] == STEP_STATUS_COMPLETED:
+            total += weight
+        elif (
+            step["status"] == STEP_STATUS_RUNNING
+            and step["progressPercent"] is not None
+        ):
+            total += weight * (step["progressPercent"] / 100.0)
+    return min(99, int(round(total)))
+
+
+def _progress_payload(task: dict[str, Any] | str | None) -> dict[str, Any] | None:
     """把引擎 session 的实时进度翻译成任务响应里的 ``progress``。
 
     读不到（没有 session / 尚未开始 / 引擎未落进度）时返回 ``None`` ——
     客户端据此显示「排队中」，而**不是**伪造一个 0% 进度。
+
+    ``steps`` 是本次改造的核心：5 个节点各自的真实状态由**后端**判定，
+    客户端只负责渲染，不再用「当前步号 + 本地时钟」推断。
+
+    兼容旧调用：传入裸 ``session_id`` 字符串时按「processing、无任务行」
+    处理（仅供进度映射的单测使用；HTTP 路径一律传任务 dict）。
     """
+    if task is None:
+        return None
+    if isinstance(task, str):
+        task = {"sessionId": task, "status": CareerlyStore.TASK_PROCESSING}
+    session_id = task.get("sessionId")
     if not session_id:
         return None
     raw = get_engine_store().get_session_progress(session_id)
     if not raw:
         return None
+
     node = raw.get("current_node")
+    node = node if isinstance(node, str) else None
+    completed_nodes = raw.get("completed_nodes")
+    if not isinstance(completed_nodes, list):
+        completed_nodes = []
+    completed_set = {n for n in completed_nodes if isinstance(n, str)}
+
+    steps = _build_steps(
+        task_status=task.get("status") or CareerlyStore.TASK_QUEUED,
+        node=node,
+        node_status=raw.get("node_status"),
+        completed_nodes=completed_set,
+        error_message=task.get("errorMessage"),
+    )
+    overall = _overall_progress(steps, task.get("status") or "")
+
     return {
         "currentNode": node,
         "nodeStatus": raw.get("node_status"),
         "completedCount": raw.get("completed_count"),
         "totalNodes": ENGINE_NODE_COUNT,
         # 产品步骤（0 基）。未知节点 → None，客户端保持当前步不动。
-        "stepIndex": _NODE_TO_STEP.get(node) if isinstance(node, str) else None,
+        "stepIndex": _NODE_TO_STEP.get(node) if node else None,
         "totalSteps": ANALYSIS_STEP_COUNT,
         "updatedAt": raw.get("_updated_at"),
+        # 新增：5 步真实状态 + 后端加权总进度。旧字段保留以兼容旧客户端。
+        "steps": steps,
+        "overallProgress": overall,
     }
 
 
 # ── Analysis ────────────────────────────────────────────────────────────────
 
 
+class _PreparedAnalysis:
+    """``_prepare_task`` 的返回值：要么带 ``failure``，要么带完整运行参数。"""
+
+    def __init__(
+        self,
+        *,
+        failure: Any = None,
+        task_id: str | None = None,
+        session_id: str | None = None,
+        resume_text: str | None = None,
+        resume_version_id: str | None = None,
+        resume_version_label: str | None = None,
+        jd_snapshot: dict[str, Any] | None = None,
+    ):
+        self.failure = failure
+        self.task_id = task_id
+        self.session_id = session_id
+        self.resume_text = resume_text
+        self.resume_version_id = resume_version_id
+        self.resume_version_label = resume_version_label
+        self.jd_snapshot = jd_snapshot
+
+
 def _prepare_task(
     store: CareerlyStore,
     user_id: int,
     req: AnalyzeRequest,
-) -> tuple[Any, str | None, str | None, str | None]:
-    """建任务 + 跑前置校验。返回 ``(错误响应, task_id, session_id, resume_text)``。
+) -> _PreparedAnalysis:
+    """建任务 + 预占额度 + 跑前置校验。
 
     ── P1-1a：任务留痕，**在一切校验之前**建任务。
     为什么必须在最前面：配额不足、缺少基线这类前置拒绝恰恰是最常见的失败，
@@ -172,42 +376,84 @@ def _prepare_task(
     先生成 id → 写进任务行 → 交给引擎，运行期间 ``GET /analysis/tasks/{id}``
     才有东西可查。反过来（等引擎自己生成再回写）在同步接口下永远拿不到。
 
-    前置拒绝时后三个返回值为 ``None``，调用方直接返回 ``错误响应``。
+    ── P1-01 / P1-02：在任务创建时把「实际使用的简历版本」和
+    「实际使用的 JD 原文」固定下来。之后用户切换简历 / 修改岗位，
+    都不会改写这次分析已经绑定的证据。
+
+    ── P1-03：额度从「先检查后扣减」改为**原子预占**。
+    预占失败（免费额度耗尽）才拒绝；成功 / 失败分别由任务终态
+    确认消耗或释放。同步与异步入口共用这一段，因此两条路径的额度
+    语义逐字一致。
     """
     session_id = StateStore.new_session_id()
+    captured_at = iso(time.time())
+    jd_snapshot = {
+        "title": req.title.strip(),
+        "company": (req.company or "").strip(),
+        "rawJd": req.rawJd,
+        "source": req.source or "paste",
+        "sourceUrl": req.sourceUrl,
+        "importMethod": req.source or "paste",
+        "capturedAt": captured_at,
+    }
+
+    # 简历来源：内联文本优先；否则用当前简历版本（同时拿到版本 id）。
+    # 内联文本没有版本 id —— 它本来就不是「用户简历库里的某一版」，
+    # 不能伪造一个绑定。
+    resume_text = (req.resumeText or "").strip()
+    resume_version_id: str | None = None
+    resume_version_label: str | None = None
+    current = store.get_current_resume_version(user_id)
+    if not resume_text:
+        if current is not None:
+            resume_version_id = current.get("id")
+            resume_version_label = current.get("label")
+            resume_text = (current.get("text") or "").strip()
+    elif current is not None and (current.get("text") or "").strip() == resume_text:
+        # 内联文本与当前版本逐字相同 → 它就是那一版，可以安全绑定。
+        # 不同则视为 ad-hoc 文本，**不**绑定、也**不**回写当前简历。
+        resume_version_id = current.get("id")
+        resume_version_label = current.get("label")
+
     task_id = store.create_task(
-        user_id, req.title, source="paste", session_id=session_id,
+        user_id,
+        req.title,
+        source=req.source or "paste",
+        session_id=session_id,
+        resume_version_id=resume_version_id,
+        resume_version_label=resume_version_label,
+        jd_snapshot=jd_snapshot,
     )
 
     # Quota gate (Baseline §5 / PRD §16): free users get 3 analyses total.
-    quota = store.get_quota(user_id)
-    if not quota.isMember and quota.used >= quota.total:
+    # ⚠️ 这里必须是**原子预占**，不能先 get_quota 再在成功后 consume ——
+    # 那样两个并发请求会同时通过检查（P1-03）。
+    reserved = store.reserve_analysis_quota(user_id, task_id)
+    if reserved == CareerlyStore.QUOTA_EXHAUSTED:
         store.fail_task(task_id, "QUOTA_EXCEEDED", "免费分析次数已用完")
-        return (
-            err(
-                "QUOTA_EXCEEDED",
-                "免费分析次数已用完，升级会员后可继续分析",
-                403,
-                details={"quota": dump(quota)},
-            ),
-            None,
-            None,
-            None,
-        )
+        quota = store.get_quota(user_id)
+        return _PreparedAnalysis(failure=err(
+            "QUOTA_EXCEEDED",
+            "免费分析次数已用完，升级会员后可继续分析",
+            403,
+            details={"quota": dump(quota)},
+        ))
 
-    # Resume source: inline text wins, else the persisted baseline (P3).
-    resume_text = (req.resumeText or "").strip()
-    if not resume_text:
-        baseline = store.get_resume(user_id)
-        resume_text = (baseline or {}).get("text", "").strip()
     if not resume_text:
         # P1-2：与 engine.run_analysis 的 NO_BASELINE 保持同一错误码，
         # 否则「内联简历缺失」和「基线缺失」会给出两个不同的 code，前端无法统一处理。
         message = "尚未建立职业基线：请先上传简历或传入 resumeText"
-        store.fail_task(task_id, "NO_BASELINE", message)
-        return err("NO_BASELINE", message, 422), None, None, None
+        store.fail_task(task_id, "NO_BASELINE", message)  # fail_task 会释放预占
+        return _PreparedAnalysis(failure=err("NO_BASELINE", message, 422))
 
-    return None, task_id, session_id, resume_text
+    return _PreparedAnalysis(
+        task_id=task_id,
+        session_id=session_id,
+        resume_text=resume_text,
+        resume_version_id=resume_version_id,
+        resume_version_label=resume_version_label,
+        jd_snapshot=jd_snapshot,
+    )
 
 
 async def _execute_analysis(
@@ -219,6 +465,10 @@ async def _execute_analysis(
     title: str,
     raw_jd: str,
     resume_text: str,
+    resume_version_id: str | None = None,
+    resume_version_label: str | None = None,
+    jd_snapshot: dict[str, Any] | None = None,
+    cancel_check: Any = None,
 ):
     """跑引擎并把成功产物落库；返回 ``AnalysisProject``。
 
@@ -239,13 +489,41 @@ async def _execute_analysis(
                 raw_jd=raw_jd,
                 resume_text=resume_text,
                 session_id=session_id,
+                cancel_check=cancel_check,
             ),
         )
+    except AnalysisCancelled:
+        raise
     except AnalysisError:
         raise
     except Exception as exc:  # pragma: no cover - unexpected engine crash
         logger.exception("Careerly analyze crashed | user=%d | task=%s", user_id, task_id)
         raise AnalysisError("ANALYSIS_FAILED", f"分析失败：{exc}", 502) from exc
+
+    # 最后一道闸：取消后**绝不**写项目、绝不扣额度、绝不标完成。
+    if cancel_check is not None and cancel_check():
+        raise AnalysisCancelled()
+
+    # P1-01 / P1-02：把「本次实际使用的简历版本 + JD 原文」绑定到
+    # 结果记录上。这些值来自任务创建时的快照，不会再被后续修改影响。
+    for result in project.results:
+        result.resumeVersionId = resume_version_id
+        result.resumeVersionLabel = resume_version_label
+        if jd_snapshot:
+            result.jobSnapshots = [
+                JobSnapshot(
+                    jobId=job.id,
+                    title=jd_snapshot.get("title", job.title),
+                    company=jd_snapshot.get("company", job.company),
+                    rawJd=jd_snapshot.get("rawJd", raw_jd),
+                    source=jd_snapshot.get("source"),
+                    sourceUrl=jd_snapshot.get("sourceUrl"),
+                    importMethod=jd_snapshot.get("importMethod"),
+                    capturedAt=jd_snapshot.get("capturedAt"),
+                    available=True,
+                )
+                for job in project.jobs
+            ]
 
     store.save_project(user_id, project)
     # P3-1：把引擎解析出的简历画像落库 —— 这是「我的 → 职业资产」的真实数据源。
@@ -253,16 +531,44 @@ async def _execute_analysis(
     # ⚠️ 只在画像非空时写：分析链路可能降级产出 {}，用空值覆盖已有画像
     # 会让「我的」在功能上回到 Mock 之前的状态。
     if resume_profile:
-        store.save_resume(user_id, resume_text, resume_profile)
-    growth.record_analysis_growth(store, user_id, project)  # P2：快照 + 成长事件
-    store.consume_quota(user_id)
-    store.complete_task(task_id, project.id)
+        if resume_version_id:
+            # P1-01：写回**本次实际使用的那一版**，不碰分析期间可能已经
+            # 切成当前的其他版本。
+            store.update_resume_version_profile(
+                user_id, resume_version_id, resume_profile
+            )
+        elif store.get_resume(user_id) is None:
+            # 内联简历 + 用户还没有任何基线 → 这是唯一一份简历，
+            # 建立基线是合理的最小行为（否则职业资产永远为空）。
+            # ⚠️ 已有基线时不写：不能拿一次 ad-hoc 分析覆盖用户资产。
+            store.save_resume(user_id, resume_text, resume_profile)
+    growth.record_analysis_growth(  # P2/P1-03：快照 + 兼容性校验后的事件
+        store, user_id, project,
+        resume_text=resume_text,
+        resume_version_id=resume_version_id,
+        resume_version_label=resume_version_label,
+    )
+    # P1-03：额度确认与任务完成放在同一个条件更新里 ——
+    # 任务已被取消 / 已完成时不会再扣一次。
+    if not store.complete_task(task_id, project.id):
+        logger.info(
+            "Careerly analysis finished after task became terminal | task=%s",
+            task_id,
+        )
     return project
 
 
 #: 后台分析任务的强引用。不保存引用的话，asyncio 可能在任务跑完前
 #: 把它回收掉（事件循环只持弱引用）。
 _background_tasks: set[asyncio.Task] = set()
+
+#: 每个进行中任务的取消标志（task_id → Event）。
+#:
+#: 为什么用 ``threading.Event`` 而不是 ``asyncio.Task.cancel()``：
+#: 引擎跑在 ``run_in_executor`` 的**线程**里，协程取消无法穿透线程。
+#: 一个线程安全的布尔标志由引擎在每个节点边界主动检查，是唯一可靠的
+#: 协作式中止点（见 ``orchestrator._update_status``）。
+_task_cancel_events: dict[str, threading.Event] = {}
 
 
 @router.post("/analysis")
@@ -278,11 +584,15 @@ async def analyze(
     store = get_store()
     user_id = int(current_user["id"])
 
-    failure, task_id, session_id, resume_text = _prepare_task(store, user_id, req)
-    if failure is not None:
-        return failure
+    prepared = _prepare_task(store, user_id, req)
+    if prepared.failure is not None:
+        return prepared.failure
+    task_id = prepared.task_id
+    session_id = prepared.session_id
 
-    store.start_task(task_id)
+    if not store.start_task(task_id):
+        # 任务在创建与启动之间被取消（或已到终态）：绝不继续跑引擎。
+        return err("ANALYSIS_CANCELLED", "分析已取消", 409)
     try:
         project = await _execute_analysis(
             store=store,
@@ -291,7 +601,10 @@ async def analyze(
             session_id=session_id,
             title=req.title,
             raw_jd=req.rawJd,
-            resume_text=resume_text,
+            resume_text=prepared.resume_text or "",
+            resume_version_id=prepared.resume_version_id,
+            resume_version_label=prepared.resume_version_label,
+            jd_snapshot=prepared.jd_snapshot,
         )
     except AnalysisError as exc:
         # P1-2：失败必须落库，消灭「失败无痕」。
@@ -299,6 +612,12 @@ async def analyze(
         logger.warning("Careerly analyze failed | user=%d | task=%s | code=%s",
                        user_id, task_id, exc.code)
         return err(exc.code, exc.message, exc.status_code)
+    except Exception as exc:  # pragma: no cover - 落库阶段的意外
+        # P1-03 / P1-06：即使失败发生在落库阶段，也必须释放预占额度，
+        # 否则任务会永久占着一次免费额度直到服务重启。
+        store.fail_task(task_id, "ANALYSIS_FAILED", str(exc))
+        logger.exception("Careerly analyze crashed | user=%d | task=%s", user_id, task_id)
+        return err("ANALYSIS_FAILED", f"分析失败：{exc}", 502)
 
     logger.info("Careerly analyze | user=%d | project=%s | task=%s",
                 user_id, project.id, task_id)
@@ -321,11 +640,24 @@ async def start_analysis_task(
     store = get_store()
     user_id = int(current_user["id"])
 
-    failure, task_id, session_id, resume_text = _prepare_task(store, user_id, req)
-    if failure is not None:
-        return failure
+    prepared = _prepare_task(store, user_id, req)
+    if prepared.failure is not None:
+        return prepared.failure
+    task_id = prepared.task_id
+    session_id = prepared.session_id
 
-    store.start_task(task_id)
+    if not store.start_task(task_id):
+        current = store.get_task(user_id, task_id)
+        return ok(
+            {
+                "taskId": task_id,
+                "status": (current or {}).get("status", CareerlyStore.TASK_CANCELLED),
+            },
+            status_code=202,
+        )
+
+    cancel_event = threading.Event()
+    _task_cancel_events[task_id] = cancel_event
 
     async def _background() -> None:
         try:
@@ -336,18 +668,37 @@ async def start_analysis_task(
                 session_id=session_id,
                 title=req.title,
                 raw_jd=req.rawJd,
-                resume_text=resume_text,
+                resume_text=prepared.resume_text or "",
+                resume_version_id=prepared.resume_version_id,
+                resume_version_label=prepared.resume_version_label,
+                jd_snapshot=prepared.jd_snapshot,
+                cancel_check=cancel_event.is_set,
             )
+        except AnalysisCancelled:
+            # 取消是正常路径：终态已由 cancel 接口写入，这里不写失败原因。
+            store.cancel_task(task_id)
+            logger.info("Careerly async analyze cancelled | user=%d | task=%s",
+                        user_id, task_id)
+            return
         except AnalysisError as exc:
+            # 取消与异常竞态：用户已取消时，不要把 cancelled 覆盖成 failed。
+            if cancel_event.is_set():
+                store.cancel_task(task_id)
+                return
             store.fail_task(task_id, exc.code, exc.message)
             logger.warning("Careerly async analyze failed | user=%d | task=%s | code=%s",
                            user_id, task_id, exc.code)
             return
         except Exception as exc:  # pragma: no cover - 落库阶段的意外
+            if cancel_event.is_set():
+                store.cancel_task(task_id)
+                return
             store.fail_task(task_id, "ANALYSIS_FAILED", str(exc))
             logger.exception("Careerly async analyze crashed | user=%d | task=%s",
                              user_id, task_id)
             return
+        finally:
+            _task_cancel_events.pop(task_id, None)
         logger.info("Careerly async analyze | user=%d | project=%s | task=%s",
                     user_id, project.id, task_id)
 
@@ -457,7 +808,40 @@ async def get_task(
         return err("NOT_FOUND", f"分析任务 {task_id} 不存在", 404)
     # P1-1b：附上引擎的实时节点进度。``None`` = 读不到（无绑定 / 未开始），
     # 客户端据此显示「排队中」而不是伪造进度。
-    task["progress"] = _progress_payload(task.get("sessionId"))
+    task["progress"] = _progress_payload(task)
+    return ok(task)
+
+
+@router.post("/analysis/tasks/{task_id}/cancel")
+async def cancel_task(
+    task_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """取消一个进行中的分析任务（「退出分析」确认后调用）。
+
+    语义：
+    - 幂等：任务已是终态时直接返回当前快照，不报错；
+    - 归属：与 ``GET /analysis/tasks/{id}`` 同码 404，不泄露存在性；
+    - 中止：置任务为 ``cancelled`` + 通知引擎在**下一个节点边界**停下。
+      正在执行的单个节点（如一次 LLM 调用）无法被线程池强行打断，
+      但它完成后不会写项目、不会扣额度、不会再推进进度。
+    """
+    store = get_store()
+    user_id = int(current_user["id"])
+    task = store.get_task(user_id, task_id)
+    if task is None:
+        return err("NOT_FOUND", f"分析任务 {task_id} 不存在", 404)
+
+    if task["status"] not in CareerlyStore.TERMINAL_TASK_STATUSES:
+        # 先发取消信号，再落终态：后台任务若恰好在此刻结束，终态以
+        # complete_task / fail_task 的写入为准（cancel_task 不会降级已终态）。
+        event = _task_cancel_events.get(task_id)
+        if event is not None:
+            event.set()
+        store.cancel_task(task_id)
+        task = store.get_task(user_id, task_id) or task
+
+    task["progress"] = _progress_payload(task)
     return ok(task)
 
 

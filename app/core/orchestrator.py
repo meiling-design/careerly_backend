@@ -57,6 +57,14 @@ from app.services.llm_service import LLMService
 from app.utils.logger import logger
 
 
+class AnalysisCancelledError(Exception):
+    """Raised when a caller-owned cancel flag turns true at a node boundary.
+
+    ⚠️ 只在本进程显式传入 ``cancel_check`` 时才会出现；旧的调用方
+    （个人网站 / CLI）不传该参数，行为完全不变。
+    """
+
+
 class DecisionGraph:
     """LangGraph-based decision graph for the job matching pipeline.
 
@@ -116,6 +124,10 @@ class DecisionGraph:
 
         # Progress tracking for the /tasks endpoint
         self._completed_nodes: set[str] = set()
+
+        # 可选的协作式取消检查（Careerly 的「退出分析」用）。
+        # ``None`` = 不启用，旧调用方行为不变。
+        self._cancel_check: Optional[Callable[[], bool]] = None
 
         # Compiled graph (built lazily)
         self._graph: Optional[Any] = None
@@ -764,6 +776,7 @@ class DecisionGraph:
         session_id: Optional[str] = None,
         use_llm: bool = True,
         use_embedding: bool = True,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> GraphState:
         """Execute the full decision graph pipeline.
 
@@ -788,6 +801,8 @@ class DecisionGraph:
 
         # Reset progress tracking for fresh run
         self._completed_nodes.clear()
+        # 协作式取消：每次 run 显式绑定，避免上一轮任务的取消标志串到下一轮。
+        self._cancel_check = cancel_check
 
         # ── Session resume: restore state from SQLite if available ─────────
         session_exists = self.store.session_exists(sid)
@@ -870,6 +885,13 @@ class DecisionGraph:
                           sid, {k: v.status for k, v in final_state.statuses.items()})
             return final_state
 
+        except AnalysisCancelledError:
+            # 取消不是故障：session 标 cancelled，把异常原样抛给调用方，
+            # 由 Careerly 层落成任务状态 cancelled（不写失败原因）。
+            self.store.update_session_status(sid, "cancelled")
+            logger.info("DecisionGraph CANCELLED | session=%s", sid)
+            raise
+
         except Exception as e:
             error_msg = "Graph execution failed: %s\n%s" % (e, traceback.format_exc())
             logger.error(error_msg)
@@ -891,6 +913,7 @@ class DecisionGraph:
         session_id: Optional[str] = None,
         use_llm: bool = True,
         use_embedding: bool = True,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> GraphState:
         """Synchronous wrapper for ``run()`` — runs in a thread executor.
 
@@ -910,6 +933,7 @@ class DecisionGraph:
             session_id=session_id,
             use_llm=use_llm,
             use_embedding=use_embedding,
+            cancel_check=cancel_check,
         ))
 
     # ═════════════════════════════════════════════════════════════════════
@@ -924,6 +948,12 @@ class DecisionGraph:
         error: Optional[str] = None,
     ) -> None:
         """Update the status of a graph node and push progress to state store."""
+        # 协作式取消：每个节点的状态变更点都是一次安全检查。
+        # 取消耗时较长的节点（如 routing 的 LLM 调用）仍会跑完当前节点，
+        # 但下一个边界立即中止 —— 这是线程池里能做到的最诚实的中止点。
+        if self._cancel_check is not None and self._cancel_check():
+            raise AnalysisCancelledError("分析已取消")
+
         timestamp = datetime.now(timezone.utc).isoformat()
         state.statuses[node_name] = AgentStatus(
             name=node_name,
@@ -943,7 +973,13 @@ class DecisionGraph:
             self._completed_nodes.add(node_name)
             completed = len(self._completed_nodes)
         try:
-            kwargs: dict[str, Any] = {"current_node": node_name, "node_status": status}
+            kwargs: dict[str, Any] = {
+                "current_node": node_name,
+                "node_status": status,
+                # Careerly 的 5 步时间线需要知道**哪些**节点完成了，
+                # 单靠 current_node 推导不出失败前的完成集合。
+                "completed_nodes": sorted(self._completed_nodes),
+            }
             if completed is not None:
                 kwargs["completed_count"] = completed
             self.store.update_session_progress(state.session_id, **kwargs)

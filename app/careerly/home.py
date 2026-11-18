@@ -120,41 +120,50 @@ def _headline(project: Any, capabilities: list[dict]) -> tuple[str, str]:
 
 
 def _match_changes(store: Any, user_id: int) -> list[MatchChange]:
-    """Score movement between the two newest snapshots, joined to job titles.
+    """Score movement between two **comparable** snapshots (P1-03).
+
+    只有同一目标岗位 + 同一 JD + 不同简历才允许比较（判定在
+    ``growth.match_score_comparable``）。不同岗位的匹配分不能相减——
+    「AI 产品经理 78 → AI 产品运营 82」不是 +4 的成长。
 
     Only emitted when ``matchScore`` actually changed — a delta of 0 is not a
     "change" and showing it would pad the card with noise.
     """
+    from app.careerly import growth
+
     latest = store.get_latest_snapshot(user_id)
     if not latest:
         return []
-    previous = store.get_previous_snapshot(user_id, latest["id"])
+    new_scores = latest.get("scores") or {}
+    previous = store.get_previous_compatible_snapshot(
+        user_id, latest["id"], new_scores.get("scoringVersion")
+    )
     if not previous:
         return []
+    old_scores = previous.get("scores") or {}
 
-    new_score = (latest.get("scores") or {}).get("matchScore")
-    old_score = (previous.get("scores") or {}).get("matchScore")
+    new_score = new_scores.get("matchScore")
+    old_score = old_scores.get("matchScore")
     if not isinstance(new_score, int) or not isinstance(old_score, int):
+        return []
+    if not growth.match_score_comparable(old_scores, new_scores):
         return []
     delta = new_score - old_score
     if delta == 0:
         return []
 
-    # The snapshot's ``sourceId`` is the project id, which resolves to the job
-    # the score belongs to. Without it we cannot honestly label the row.
-    project_id = latest.get("sourceId")
-    if not project_id:
+    # 岗位名 / 公司名取**快照**里记录的本次分析输入，而不是当前 jobs 行 ——
+    # 后者可能在分析之后被改名，那样首页会把变化标到错误的岗位上。
+    match_meta = new_scores.get("match") or {}
+    job_id = match_meta.get("jobId")
+    if not job_id:
         return []
-    project = store.get_project(user_id, project_id)
-    if project is None or not project.jobs:
-        return []
-    job = project.jobs[0]
 
     return [
         MatchChange(
-            jobId=job.id,
-            jobTitle=job.title,
-            company=job.company or None,
+            jobId=job_id,
+            jobTitle=match_meta.get("jobTitle") or "",
+            company=match_meta.get("company") or None,
             score=new_score,
             delta=delta,
         )

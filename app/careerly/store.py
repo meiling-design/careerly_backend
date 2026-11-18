@@ -16,6 +16,7 @@ Design notes
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
 import threading
@@ -30,6 +31,7 @@ from app.careerly.schemas import (
     GapDetail,
     JobMatch,
     JobModel,
+    JobSnapshot,
     QuotaState,
     StrengthScore,
     iso,
@@ -41,14 +43,40 @@ DB_PATH = DATA_DIR / "careerly.db"
 
 _local = threading.local()
 
+#: 只保护「建立连接 + 设 PRAGMA」这一步。
+#:
+#: ``PRAGMA journal_mode=WAL`` 本身需要一次短暂的写锁；多个线程同时
+#: 首次建连接时会在这里互相撞上 ``database is locked``（P1-03 的并发
+#: 测试第一次跑就暴露了）。真正的事务型 UPDATE 仍由 SQLite 自己串行化，
+#: 这个锁不会把并发预占变成串行业务逻辑。
+_conn_lock = threading.Lock()
+
 
 def _get_conn(db_path: str = str(DB_PATH)) -> sqlite3.Connection:
     if not hasattr(_local, "careerly_conn") or _local.careerly_conn is None:
-        _local.careerly_conn = sqlite3.connect(db_path, check_same_thread=False)
-        _local.careerly_conn.row_factory = sqlite3.Row
-        _local.careerly_conn.execute("PRAGMA journal_mode=WAL")
-        _local.careerly_conn.execute("PRAGMA busy_timeout=5000")
+        with _conn_lock:
+            if not hasattr(_local, "careerly_conn") or _local.careerly_conn is None:
+                conn = sqlite3.connect(
+                    db_path, timeout=30.0, check_same_thread=False,
+                )
+                conn.row_factory = sqlite3.Row
+                # WAL 是**数据库级**持久属性，只在初始化时设置一次
+                # （见 ``_init_schema``）。每条新连接再设一遍需要短暂的
+                # 写锁，并发首次建连会互相等待数秒。
+                conn.execute("PRAGMA busy_timeout=30000")
+                _local.careerly_conn = conn
     return _local.careerly_conn
+
+
+def _quota_transaction(fn):
+    """串行化同一 Store 实例内的额度事务（见 ``__init__`` 的说明）。"""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._quota_lock:
+            return fn(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _j(value: Any) -> str:
@@ -69,6 +97,9 @@ class CareerlyStore:
 
     def __init__(self, db_path: str | Path | None = None):
         self.db_path = str(db_path or DB_PATH)
+        # 进程内额度事务锁：SQLite 的条件 UPDATE 已保证跨进程正确性；
+        # 这把锁只是避免同进程并发请求在 SQLite busy handler 里空转数秒。
+        self._quota_lock = threading.Lock()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -76,6 +107,7 @@ class CareerlyStore:
 
     def _init_schema(self) -> None:
         conn = _get_conn(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS analysis_projects (
                 id         TEXT PRIMARY KEY,
@@ -107,8 +139,29 @@ class CareerlyStore:
                 project_id          TEXT NOT NULL,
                 version             INTEGER NOT NULL,
                 resume_version_id   TEXT,
+                resume_version_label TEXT,
                 capability_snapshot TEXT,
                 created_at          REAL NOT NULL
+            );
+
+            -- P1-02：分析记录实际使用的 JD 原文快照。
+            -- 与 jobs 表**分开**：jobs 是可变的岗位实体，快照是某一次分析
+            -- 的只读证据。写入后永不更新；重新解析链接 / 修改岗位信息
+            -- 都不得覆盖它。历史行没有记录 → 前端展示「原文缺失」，
+            -- 绝不用当前 jobs.raw_jd 冒充。
+            CREATE TABLE IF NOT EXISTS analysis_job_snapshots (
+                id            TEXT PRIMARY KEY,
+                result_id     TEXT NOT NULL,
+                job_id        TEXT NOT NULL,
+                title         TEXT NOT NULL DEFAULT '',
+                company       TEXT NOT NULL DEFAULT '',
+                raw_jd        TEXT NOT NULL DEFAULT '',
+                source        TEXT,
+                source_url    TEXT,
+                import_method TEXT,
+                captured_at   REAL NOT NULL,
+                created_at    REAL NOT NULL,
+                UNIQUE (result_id, job_id)
             );
 
             CREATE TABLE IF NOT EXISTS job_matches (
@@ -176,7 +229,8 @@ class CareerlyStore:
             CREATE TABLE IF NOT EXISTS user_quota (
                 user_id   INTEGER PRIMARY KEY,
                 total     INTEGER NOT NULL DEFAULT 3,
-                used      INTEGER NOT NULL DEFAULT 0,
+                used      INTEGER NOT NULL DEFAULT 0,   -- 已确认消耗
+                reserved  INTEGER NOT NULL DEFAULT 0,   -- 已预占、尚未确认（P1-03）
                 is_member INTEGER NOT NULL DEFAULT 0
             );
 
@@ -199,10 +253,15 @@ class CareerlyStore:
                 id            TEXT PRIMARY KEY,
                 user_id       INTEGER NOT NULL,
                 project_id    TEXT,               -- 成功后回填，失败为 NULL
-                status        TEXT NOT NULL,      -- queued|processing|completed|failed
+                status        TEXT NOT NULL,      -- queued|processing|completed|failed|cancelled
                 title         TEXT NOT NULL DEFAULT '',
                 source        TEXT NOT NULL DEFAULT 'paste',
                 session_id    TEXT,               -- P1-1b：引擎 session 的显式绑定
+                resume_version_id    TEXT,        -- P1-01：任务创建时绑定的简历版本
+                resume_version_label TEXT,
+                jd_snapshot   TEXT,               -- P1-02：任务创建时的 JD 快照 JSON
+                quota_state   TEXT NOT NULL DEFAULT 'none',
+                                 -- none|reserved|consumed|released|member (P1-03)
                 error_code    TEXT,               -- status=failed 时
                 error_message TEXT,
                 created_at    REAL NOT NULL,
@@ -238,6 +297,8 @@ class CareerlyStore:
             CREATE INDEX IF NOT EXISTS idx_projects_user ON analysis_projects(user_id);
             CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id);
             CREATE INDEX IF NOT EXISTS idx_results_project ON analysis_results(project_id);
+            CREATE INDEX IF NOT EXISTS idx_job_snapshots_result
+                ON analysis_job_snapshots (result_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_user ON analysis_tasks(user_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON analysis_tasks(status);
             CREATE INDEX IF NOT EXISTS idx_snapshots_user ON capability_snapshots(user_id, created_at);
@@ -264,6 +325,34 @@ class CareerlyStore:
             # P1-1b：既有库补列。历史任务该列为 NULL —— 它们的引擎 session
             # 从未被绑定，进度不可回溯（迁移前本就没有可观测面可言）。
             conn.execute("ALTER TABLE analysis_tasks ADD COLUMN session_id TEXT")
+        # P1-01 / P1-02 / P1-03：既有库补列。历史任务这些列为 NULL / none，
+        # 表示「迁移前的数据没有这些证据」—— 不猜测、不回填。
+        for column, ddl in (
+            ("resume_version_id", "TEXT"),
+            ("resume_version_label", "TEXT"),
+            ("jd_snapshot", "TEXT"),
+            ("quota_state", "TEXT NOT NULL DEFAULT 'none'"),
+        ):
+            if column not in task_columns:
+                conn.execute(f"ALTER TABLE analysis_tasks ADD COLUMN {column} {ddl}")
+
+        result_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(analysis_results)").fetchall()
+        }
+        if "resume_version_label" not in result_columns:
+            conn.execute(
+                "ALTER TABLE analysis_results ADD COLUMN resume_version_label TEXT"
+            )
+
+        quota_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(user_quota)").fetchall()
+        }
+        if "reserved" not in quota_columns:
+            conn.execute(
+                "ALTER TABLE user_quota ADD COLUMN reserved INTEGER NOT NULL DEFAULT 0"
+            )
         conn.commit()
 
     # ── Projects ────────────────────────────────────────────────────────
@@ -296,12 +385,31 @@ class CareerlyStore:
         for result in project.results:
             conn.execute(
                 "INSERT OR REPLACE INTO analysis_results "
-                "(id, project_id, version, resume_version_id, capability_snapshot, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(id, project_id, version, resume_version_id, resume_version_label, "
+                " capability_snapshot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (result.id, result.projectId or project.id, result.version,
-                 result.resumeVersionId, _j(result.capabilitySnapshot),
+                 result.resumeVersionId, result.resumeVersionLabel,
+                 _j(result.capabilitySnapshot),
                  self._parse_ts(result.createdAt) or now),
             )
+            # P1-02：写入本次分析的 JD 快照。``INSERT OR IGNORE`` 而不是
+            # REPLACE —— 同一条分析记录的快照**第一次写入即定稿**，
+            # 任何后续保存都不得覆盖它。
+            for snap in result.jobSnapshots:
+                if not snap.available:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO analysis_job_snapshots "
+                    "(id, result_id, job_id, title, company, raw_jd, source, "
+                    " source_url, import_method, captured_at, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        f"jsnap_{uuid.uuid4().hex[:16]}", result.id, snap.jobId,
+                        snap.title, snap.company, snap.rawJd, snap.source,
+                        snap.sourceUrl, snap.importMethod,
+                        self._parse_ts(snap.capturedAt) or now, now,
+                    ),
+                )
             for match in result.matches:
                 conn.execute(
                     "INSERT OR REPLACE INTO job_matches "
@@ -370,11 +478,37 @@ class CareerlyStore:
                     "SELECT * FROM job_matches WHERE result_id = ? ORDER BY rank", (r["id"],)
                 ).fetchall()
             ]
+            snapshots: list[JobSnapshot] = []
+            known_job_ids: set[str] = set()
+            for s in conn.execute(
+                "SELECT * FROM analysis_job_snapshots WHERE result_id = ?", (r["id"],)
+            ).fetchall():
+                known_job_ids.add(s["job_id"])
+                snapshots.append(JobSnapshot(
+                    jobId=s["job_id"],
+                    title=s["title"],
+                    company=s["company"],
+                    rawJd=s["raw_jd"],
+                    source=s["source"],
+                    sourceUrl=s["source_url"],
+                    importMethod=s["import_method"],
+                    capturedAt=iso(s["captured_at"]),
+                    available=True,
+                ))
+            # 历史数据兼容（P1-02）：迁移前的结果没有快照行。**明确**给出
+            # ``available=False``，而不是让调用方去读当前 ``jobs.raw_jd``。
+            for match in matches:
+                if match.jobId not in known_job_ids:
+                    snapshots.append(JobSnapshot(
+                        jobId=match.jobId, available=False,
+                    ))
             results.append(AnalysisResult(
                 id=r["id"], projectId=r["project_id"], version=r["version"],
                 resumeVersionId=r["resume_version_id"],
+                resumeVersionLabel=r["resume_version_label"],
                 matches=matches,
                 capabilitySnapshot=_unjson(r["capability_snapshot"], {}),
+                jobSnapshots=snapshots,
                 createdAt=iso(r["created_at"]),
             ))
 
@@ -434,6 +568,33 @@ class CareerlyStore:
         )
         conn.commit()
 
+    def update_resume_version_profile(
+        self, user_id: int, version_id: str, profile: dict
+    ) -> None:
+        """把分析解析出的画像写回**它实际使用的那一版**简历（P1-01）。
+
+        为什么不是 ``save_resume``：分析可能跑了十几分钟，期间用户完全
+        可能把当前简历切成另一版。``save_resume`` 写的是「当前版本」，
+        那会把旧简历的文本 / 画像覆盖到新版本上。这里按 ``version_id``
+        精确定位；只有当它**仍然是当前版本**时才同步冗余的基线表。
+        """
+        conn = _get_conn(self.db_path)
+        cur = conn.execute(
+            "UPDATE careerly_resume_versions SET profile = ? "
+            "WHERE user_id = ? AND id = ?",
+            (_j(profile), user_id, version_id),
+        )
+        if cur.rowcount == 0:
+            conn.commit()
+            return
+        conn.execute(
+            "UPDATE careerly_resumes SET profile = ? WHERE user_id = ? "
+            "AND EXISTS (SELECT 1 FROM careerly_resume_versions "
+            "            WHERE user_id = ? AND id = ? AND is_current = 1)",
+            (_j(profile), user_id, user_id, version_id),
+        )
+        conn.commit()
+
     def get_resume(self, user_id: int) -> Optional[dict[str, Any]]:
         conn = _get_conn(self.db_path)
         row = conn.execute(
@@ -487,6 +648,29 @@ class CareerlyStore:
             "fileName": row["file_name"],
             "uploadedAt": iso(row["created_at"]),
             "isCurrent": bool(row["is_current"]),
+        }
+
+    def get_current_resume_version(self, user_id: int) -> dict[str, Any] | None:
+        """当前简历版本 ``{id, label, text, profile}``，没有基线时 ``None``。
+
+        P1-01：分析任务创建时调用一次，把「本次实际使用的简历版本」
+        固定下来。之后用户切到别的版本，已有分析记录的绑定不受影响。
+        """
+        self._ensure_resume_versions(user_id)
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT * FROM careerly_resume_versions "
+            "WHERE user_id = ? AND is_current = 1",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "label": f"V{row['seq']}",
+            "text": row["text"],
+            "profile": _unjson(row["profile"], {}),
+            "createdAt": iso(row["created_at"]),
         }
 
     def list_resume_versions(self, user_id: int) -> list[dict[str, Any]]:
@@ -632,14 +816,138 @@ class CareerlyStore:
             "SELECT * FROM user_quota WHERE user_id = ?", (user_id,)
         ).fetchone()
         if row is None:
-            return QuotaState(total=self.FREE_ANALYSIS_QUOTA, used=0, isMember=False)
-        return QuotaState(total=row["total"], used=row["used"], isMember=bool(row["is_member"]))
+            return QuotaState(total=self.FREE_ANALYSIS_QUOTA, used=0, reserved=0,
+                              isMember=False)
+        return QuotaState(
+            total=row["total"], used=row["used"], reserved=row["reserved"],
+            isMember=bool(row["is_member"]),
+        )
+
+    #: 预占结果取值 —— 调用方据此决定是否放行任务。
+    QUOTA_RESERVED = "reserved"
+    QUOTA_MEMBER = "member"
+    QUOTA_EXHAUSTED = "exhausted"
+
+    @_quota_transaction
+    def reserve_analysis_quota(self, user_id: int, task_id: str) -> str:
+        """原子预占一次分析额度（P1-03）。
+
+        额度检查与扣减曾经是两步：并发请求可以同时通过 ``used < total``
+        的检查，然后都成功，最终 ``used`` 超过 ``total``。这里把
+        「检查 + 预占」压缩成**一条带条件的 UPDATE** —— SQLite 保证它
+        原子执行，并发的第二个请求会看到 ``reserved`` 已加 1，条件
+        不再成立。
+
+        返回 ``reserved`` / ``member`` / ``exhausted``。会员不预占
+        （额度无限），但仍记录 ``quota_state='member'`` 以便恢复逻辑
+        知道「这个任务没有占用免费额度」。
+        """
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT is_member FROM user_quota WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            # 只在首次时写入；并发首写由 OR IGNORE 兜底。
+            conn.execute(
+                "INSERT OR IGNORE INTO user_quota "
+                "(user_id, total, used, reserved, is_member) VALUES (?, ?, 0, 0, 0)",
+                (user_id, self.FREE_ANALYSIS_QUOTA),
+            )
+            row = conn.execute(
+                "SELECT is_member FROM user_quota WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        if row is not None and row["is_member"]:
+            conn.execute(
+                "UPDATE analysis_tasks SET quota_state = 'member' WHERE id = ? AND user_id = ?",
+                (task_id, user_id),
+            )
+            conn.commit()
+            return self.QUOTA_MEMBER
+
+        cur = conn.execute(
+            "UPDATE user_quota SET reserved = reserved + 1 "
+            "WHERE user_id = ? AND is_member = 0 AND used + reserved < total",
+            (user_id,),
+        )
+        if cur.rowcount == 0:
+            conn.commit()
+            return self.QUOTA_EXHAUSTED
+
+        conn.execute(
+            "UPDATE analysis_tasks SET quota_state = 'reserved' WHERE id = ? AND user_id = ?",
+            (task_id, user_id),
+        )
+        conn.commit()
+        return self.QUOTA_RESERVED
+
+    @_quota_transaction
+    def commit_analysis_quota(self, task_id: str) -> bool:
+        """把任务的预占确认为已消耗（幂等）。
+
+        ``quota_state='reserved'`` → ``'consumed'`` 的条件更新是第一道
+        幂等闸：重复确认、任务已取消 / 已失败时都不会再动额度。
+        """
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT user_id, quota_state FROM analysis_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["quota_state"] != "reserved":
+            return False
+        cur = conn.execute(
+            "UPDATE analysis_tasks SET quota_state = 'consumed' "
+            "WHERE id = ? AND quota_state = 'reserved'",
+            (task_id,),
+        )
+        if cur.rowcount == 0:
+            conn.commit()
+            return False
+        conn.execute(
+            "UPDATE user_quota SET "
+            "  reserved = CASE WHEN reserved > 0 THEN reserved - 1 ELSE 0 END, "
+            "  used = used + 1 "
+            "WHERE user_id = ? AND is_member = 0",
+            (row["user_id"],),
+        )
+        conn.commit()
+        return True
+
+    @_quota_transaction
+    def release_analysis_quota(self, task_id: str) -> bool:
+        """释放任务的预占（幂等）。失败 / 取消 / 重启恢复都走这里。"""
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT user_id, quota_state FROM analysis_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None or row["quota_state"] != "reserved":
+            return False
+        cur = conn.execute(
+            "UPDATE analysis_tasks SET quota_state = 'released' "
+            "WHERE id = ? AND quota_state = 'reserved'",
+            (task_id,),
+        )
+        if cur.rowcount == 0:
+            conn.commit()
+            return False
+        conn.execute(
+            "UPDATE user_quota SET "
+            "  reserved = CASE WHEN reserved > 0 THEN reserved - 1 ELSE 0 END "
+            "WHERE user_id = ? AND is_member = 0",
+            (row["user_id"],),
+        )
+        conn.commit()
+        return True
 
     def consume_quota(self, user_id: int) -> None:
-        """Deduct one analysis. Only call AFTER a successful analysis."""
+        """Deduct one analysis directly (legacy helper).
+
+        ⚠️ 新代码不要用这个 —— 它绕过预占，正是 P1-03 的并发竞争来源。
+        分析链路走 :meth:`reserve_analysis_quota` + :meth:`commit_analysis_quota`。
+        保留是为了兼容仍按「成功即扣一次」语义调用的旧测试 / 脚本。
+        """
         conn = _get_conn(self.db_path)
         conn.execute(
-            "INSERT OR IGNORE INTO user_quota (user_id, total, used, is_member) VALUES (?, ?, 0, 0)",
+            "INSERT OR IGNORE INTO user_quota (user_id, total, used, reserved, is_member) "
+            "VALUES (?, ?, 0, 0, 0)",
             (user_id, self.FREE_ANALYSIS_QUOTA),
         )
         conn.execute(
@@ -672,6 +980,11 @@ class CareerlyStore:
     def consume_ai_quota(self, user_id: int) -> None:
         """Deduct one AI message. Only call AFTER the answer streamed cleanly.
 
+        ⚠️ **已知并发风险，本批次不修（见 docs/careerly/P1_FOLLOWUPS.md F1）**：
+        AI 额度仍是「先检查、流结束后扣减」，与 P1-04 修复前的分析额度同构。
+        同一用户并发发起多条对话可能同时通过检查。用户明确要求 AI 额度
+        不纳入本批次重构，故只记录、不顺手扩大修改范围。
+
         与 `consume_quota` 同一纪律：**先检查、后扣减、只有成功才扣**。
         失败（含流中断）不扣 —— 用户没有拿到回答，不该付这次数。
         """
@@ -700,6 +1013,12 @@ class CareerlyStore:
     TASK_PROCESSING = "processing"
     TASK_COMPLETED = "completed"
     TASK_FAILED = "failed"
+    TASK_CANCELLED = "cancelled"
+
+    #: 终态集合：轮询循环 / 取消接口据此判断「还能不能取消」。
+    TERMINAL_TASK_STATUSES = frozenset(
+        {TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED}
+    )
 
     def create_task(
         self,
@@ -707,6 +1026,9 @@ class CareerlyStore:
         title: str,
         source: str = "paste",
         session_id: str | None = None,
+        resume_version_id: str | None = None,
+        resume_version_label: str | None = None,
+        jd_snapshot: dict[str, Any] | None = None,
     ) -> str:
         """Insert a ``queued`` task and return its id.
 
@@ -714,47 +1036,125 @@ class CareerlyStore:
         由 **API 层生成**后同时交给引擎，于是任务在 ``queued``/``processing``
         期间就能通过 ``GET /analysis/tasks/{id}`` 报告真实节点进度。
         不传则为 NULL：任务与引擎轨迹无关联，只有终态可观测。
+
+        ``resume_version_id`` / ``jd_snapshot``（P1-01 / P1-02）——
+        **在任务创建时**就固定住「这次分析实际用了哪份简历、哪份 JD 原文」。
+        成功落库时写进 ``analysis_results`` / ``analysis_job_snapshots``；
+        失败也留在任务行里，作为可追溯的运行证据。
         """
         task_id = f"task_{uuid.uuid4().hex[:16]}"
         conn = _get_conn(self.db_path)
         conn.execute(
             "INSERT INTO analysis_tasks (id, user_id, project_id, status, title, source, "
-            " session_id, error_code, error_message, created_at, started_at, finished_at) "
-            "VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?, NULL, NULL)",
+            " session_id, resume_version_id, resume_version_label, jd_snapshot, "
+            " quota_state, error_code, error_message, created_at, started_at, finished_at) "
+            "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'none', NULL, NULL, ?, NULL, NULL)",
             (
                 task_id, user_id, self.TASK_QUEUED, title.strip(), source,
-                session_id, time.time(),
+                session_id, resume_version_id, resume_version_label,
+                _j(jd_snapshot) if jd_snapshot else None,
+                time.time(),
             ),
         )
         conn.commit()
         return task_id
 
-    def start_task(self, task_id: str) -> None:
+    def get_task_jd_snapshot(self, task_id: str) -> dict[str, Any] | None:
         conn = _get_conn(self.db_path)
-        conn.execute(
+        row = conn.execute(
+            "SELECT jd_snapshot FROM analysis_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return _unjson(row["jd_snapshot"], None)
+
+    def start_task(self, task_id: str) -> bool:
+        """queued → processing。任务已被取消时返回 ``False``，调用方不得再跑引擎。"""
+        conn = _get_conn(self.db_path)
+        cur = conn.execute(
             "UPDATE analysis_tasks SET status = ?, started_at = ? "
             "WHERE id = ? AND status = ?",
             (self.TASK_PROCESSING, time.time(), task_id, self.TASK_QUEUED),
         )
         conn.commit()
+        return cur.rowcount > 0
 
-    def complete_task(self, task_id: str, project_id: str) -> None:
+    def complete_task(self, task_id: str, project_id: str) -> bool:
+        """Mark a task completed **and** confirm its reserved quota.
+
+        只有 ``queued`` / ``processing`` 的任务能被完成 —— 条件更新同时
+        挡住了两种错误：已取消的任务被迟到的结果覆盖、已完成的任务被
+        重复确认（P1-05 / P1-03）。
+        """
         conn = _get_conn(self.db_path)
-        conn.execute(
+        cur = conn.execute(
             "UPDATE analysis_tasks SET status = ?, project_id = ?, finished_at = ?, "
-            " error_code = NULL, error_message = NULL WHERE id = ?",
-            (self.TASK_COMPLETED, project_id, time.time(), task_id),
+            " error_code = NULL, error_message = NULL "
+            "WHERE id = ? AND status IN (?, ?)",
+            (
+                self.TASK_COMPLETED, project_id, time.time(), task_id,
+                self.TASK_QUEUED, self.TASK_PROCESSING,
+            ),
         )
+        if cur.rowcount == 0:
+            conn.commit()
+            return False
         conn.commit()
+        self.commit_analysis_quota(task_id)
+        return True
 
-    def fail_task(self, task_id: str, error_code: str, error_message: str) -> None:
+    def fail_task(self, task_id: str, error_code: str, error_message: str) -> bool:
+        """Mark a task failed and release its quota reservation.
+
+        已经到终态的任务不会被降级 —— 取消 / 成功之后迟到的失败不再改写
+        状态，也不会重复释放额度（``release_analysis_quota`` 自身幂等）。
+        """
         conn = _get_conn(self.db_path)
-        conn.execute(
+        cur = conn.execute(
             "UPDATE analysis_tasks SET status = ?, finished_at = ?, error_code = ?, "
-            " error_message = ? WHERE id = ?",
-            (self.TASK_FAILED, time.time(), error_code, error_message[:2000], task_id),
+            " error_message = ? WHERE id = ? AND status IN (?, ?)",
+            (
+                self.TASK_FAILED, time.time(), error_code, error_message[:2000],
+                task_id, self.TASK_QUEUED, self.TASK_PROCESSING,
+            ),
         )
+        if cur.rowcount == 0:
+            conn.commit()
+            return False
         conn.commit()
+        self.release_analysis_quota(task_id)
+        return True
+
+    def cancel_task(
+        self,
+        task_id: str,
+        error_message: str = "分析已取消",
+    ) -> None:
+        """把未终结的任务标成 cancelled（幂等）。
+
+        ⚠️ 只允许从 queued / processing 迁移；已经 completed / failed 的任务
+        不会被降级。客户端重复点「退出」、或取消请求与任务完成并发时，
+        先到者决定终态。
+        """
+        conn = _get_conn(self.db_path)
+        cur = conn.execute(
+            "UPDATE analysis_tasks SET status = ?, finished_at = ?, "
+            " error_code = 'ANALYSIS_CANCELLED', error_message = ? "
+            "WHERE id = ? AND status IN (?, ?)",
+            (
+                self.TASK_CANCELLED,
+                time.time(),
+                error_message[:2000],
+                task_id,
+                self.TASK_QUEUED,
+                self.TASK_PROCESSING,
+            ),
+        )
+        if cur.rowcount == 0:
+            conn.commit()
+            return
+        conn.commit()
+        self.release_analysis_quota(task_id)
 
     def get_task(self, user_id: int, task_id: str) -> Optional[dict[str, Any]]:
         """Ownership-scoped read. Never filter by ``OR user_id IS NULL``."""
@@ -774,6 +1174,59 @@ class CareerlyStore:
         ).fetchall()
         return [self._task_row(r) for r in rows]
 
+    def recover_interrupted_tasks(self) -> int:
+        """启动时的任务恢复（P1-06）。
+
+        ``asyncio.create_task`` 创建的协程无法跨进程存活。进程重启后，
+        数据库里可能残留 ``queued`` / ``processing`` 的任务 —— 它们**不可能**
+        再被任何协程推进。这里：
+
+        1. 把这些任务标成 ``failed`` + ``TASK_INTERRUPTED``；
+        2. 释放它们尚未确认的额度预占；
+        3. **不重新执行**分析（没有可靠的恢复依据，重跑可能重复扣费）。
+
+        同时修复两类「状态已终态但预占未结清」的遗留行：
+        ``completed + reserved`` → 确认消耗；``failed/cancelled + reserved``
+        → 释放。这样进程在「写项目」与「确认额度」之间被杀也不会留下
+        永久占用的额度。
+
+        返回被标记为中断的任务数（便于启动日志自检）。
+        """
+        conn = _get_conn(self.db_path)
+        rows = conn.execute(
+            "SELECT id, status, quota_state FROM analysis_tasks "
+            "WHERE status IN (?, ?)",
+            (self.TASK_QUEUED, self.TASK_PROCESSING),
+        ).fetchall()
+
+        interrupted = 0
+        for row in rows:
+            if self.fail_task(
+                row["id"],
+                "TASK_INTERRUPTED",
+                "服务重启导致分析任务中断，请重新发起分析",
+            ):
+                interrupted += 1
+
+        # 终态任务与预占状态不一致的遗留行（见 docstring）。
+        terminal = conn.execute(
+            "SELECT id, status, quota_state FROM analysis_tasks "
+            "WHERE status IN (?, ?, ?) AND quota_state = 'reserved'",
+            (self.TASK_COMPLETED, self.TASK_FAILED, self.TASK_CANCELLED),
+        ).fetchall()
+        for row in terminal:
+            if row["status"] == self.TASK_COMPLETED:
+                self.commit_analysis_quota(row["id"])
+            else:
+                self.release_analysis_quota(row["id"])
+
+        if interrupted:
+            logger.info(
+                "CareerlyStore: recovered %d interrupted analysis task(s)",
+                interrupted,
+            )
+        return interrupted
+
     @staticmethod
     def _task_row(row: sqlite3.Row) -> dict[str, Any]:
         started = row["started_at"]
@@ -788,6 +1241,9 @@ class CareerlyStore:
             "sessionId": row["session_id"],
             "title": row["title"],
             "source": row["source"],
+            "resumeVersionId": row["resume_version_id"],
+            "resumeVersionLabel": row["resume_version_label"],
+            "quotaState": row["quota_state"],
             "errorCode": row["error_code"],
             "errorMessage": row["error_message"],
             "createdAt": iso(row["created_at"]),
@@ -854,6 +1310,37 @@ class CareerlyStore:
             return None
         return self._snapshot_row(row)
 
+    def get_previous_compatible_snapshot(
+        self, user_id: int, snapshot_id: str, scoring_version: str | None
+    ) -> Optional[dict[str, Any]]:
+        """上一条**评分口径兼容**的快照（P1-03），没有则 ``None``。
+
+        能力分只能在相同 ``scoringVersion`` 之间比较。旧快照没有版本号
+        （功能上线前写入）→ 不可比较，返回 ``None``；前端显示 ``delta=0``，
+        而不是拿两个不同口径的数字硬算差值。
+        """
+        if not scoring_version:
+            return None
+        conn = _get_conn(self.db_path)
+        target = conn.execute(
+            "SELECT created_at FROM capability_snapshots WHERE id = ? AND user_id = ?",
+            (snapshot_id, user_id),
+        ).fetchone()
+        if target is None:
+            return None
+        rows = conn.execute(
+            "SELECT * FROM capability_snapshots WHERE user_id = ? "
+            "  AND (created_at < ? OR (created_at = ? AND id < ?)) "
+            "ORDER BY created_at DESC, id DESC",
+            (user_id, target["created_at"], target["created_at"], snapshot_id),
+        ).fetchall()
+        for row in rows:
+            candidate = self._snapshot_row(row)
+            scores = candidate.get("scores") or {}
+            if scores.get("scoringVersion") == scoring_version:
+                return candidate
+        return None
+
     @staticmethod
     def _snapshot_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -886,7 +1373,12 @@ class CareerlyStore:
         if not scores:
             return []
 
-        previous = self.get_previous_snapshot(user_id, latest["id"])
+        latest_scores = latest.get("scores") or {}
+        # P1-03：只和**同一评分口径**的上一条快照比。旧快照没有
+        # scoringVersion → 不再产生可能误导的 delta。
+        previous = self.get_previous_compatible_snapshot(
+            user_id, latest["id"], latest_scores.get("scoringVersion")
+        )
         prev_scores: dict[str, Any] = (
             (previous.get("scores") or {}).get("capabilities") or {} if previous else {}
         )

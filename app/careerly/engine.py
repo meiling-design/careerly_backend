@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from app.careerly.schemas import (
     AnalysisProject,
@@ -47,6 +47,13 @@ class AnalysisError(Exception):
         self.code = code
         self.message = message
         self.status_code = status_code
+
+
+class AnalysisCancelled(AnalysisError):
+    """用户主动取消了分析（不是失败，不写失败原因）。"""
+
+    def __init__(self, message: str = "分析已取消"):
+        super().__init__("ANALYSIS_CANCELLED", message, 499)
 
 
 def _new_id(prefix: str) -> str:
@@ -217,6 +224,7 @@ def run_analysis(
     use_llm: bool = True,
     use_embedding: bool = True,
     session_id: str | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[AnalysisProject, dict]:
     """Run the matching engine for one pasted JD and map it to a project.
 
@@ -264,10 +272,22 @@ def run_analysis(
             use_llm=use_llm,
             use_embedding=use_embedding,
             session_id=session_id,
+            cancel_check=cancel_check,
         )
     except Exception as exc:  # pragma: no cover - engine-level failure
+        # 取消是调用方的意图，不是引擎故障 —— 必须先于通用失败分支识别。
+        from app.core.orchestrator import AnalysisCancelledError
+
+        if isinstance(exc, AnalysisCancelledError):
+            logger.info("Careerly analysis cancelled | session=%s", session_id)
+            raise AnalysisCancelled() from exc
         logger.exception("Careerly analysis failed: %s", exc)
         raise AnalysisError("ANALYSIS_FAILED", f"分析失败：{exc}", 502) from exc
+
+    # 引擎可能在「最后一个节点刚跑完、取消标志才置位」之间返回 ——
+    # 这里再确认一次，避免取消后仍然产出项目。
+    if cancel_check is not None and cancel_check():
+        raise AnalysisCancelled()
 
     # P1-2：RoutingNode 判定「数据不足、需人工介入」时，图会直接走向 END
     # （orchestrator.py:157 "ask_user" -> END），此时 match_results 为空。

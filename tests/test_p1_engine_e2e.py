@@ -506,7 +506,12 @@ def test_llm_outage_does_not_half_succeed(
 #: P1-1b 起多了 ``session_id`` —— 它是**会话标识**，不是用户身份：API 层先用它
 #: 建好任务行，引擎再拿同一个 id 跑，于是 ``GET /analysis/tasks/{id}`` 在运行
 #: 期间就能读到节点进度。引擎侧 session 的 ``user_id`` 仍为 NULL（见下）。
-_ALLOWED_ENGINE_KWARGS = {"title", "raw_jd", "resume_text", "session_id"}
+#:
+#: ``cancel_check`` 是协作式取消回调（P1-05 / 退出分析），同样不含用户身份；
+#: 它只是让引擎在节点边界检查一个进程内 Event。
+_ALLOWED_ENGINE_KWARGS = {
+    "title", "raw_jd", "resume_text", "session_id", "cancel_check",
+}
 
 #: 明确禁止出现在引擎入参里的身份字段。
 #:

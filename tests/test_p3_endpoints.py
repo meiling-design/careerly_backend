@@ -222,10 +222,11 @@ def test_summary_match_change_after_second_analysis(client, careerly_store,
     assert _analyze(client, h).status_code == 201
 
     # 第二份简历：拿掉 LangGraph → 假供应商的技能重合度下降 → 匹配分必变。
+    # ⚠️ P1-03：岗位名必须与第一次**相同** —— 不同目标岗位的匹配分不能
+    # 相减（「AI 产品经理 78 → AI 产品运营 82」不是 +4 的成长）。
     weaker_resume = _RESUME_TEXT.replace("、LangGraph", "")
     assert weaker_resume != _RESUME_TEXT
-    assert _analyze(client, h, title="云原生后端工程师",
-                    resumeText=weaker_resume).status_code == 201
+    assert _analyze(client, h, resumeText=weaker_resume).status_code == 201
 
     data = _summary(client, h)
     changes = data["matchChanges"]
@@ -241,6 +242,23 @@ def test_summary_match_change_after_second_analysis(client, careerly_store,
 
     # 成长也会有非基线事件
     assert data["recentGrowth"], "第二次分析后应有成长事件"
+
+
+def test_summary_does_not_compare_different_job_titles(client, careerly_store,
+                                                     graph_store, engine_live):
+    """P1-03：不同目标岗位的匹配分不能相减成「成长」。"""
+    from test_p1_engine_e2e import _RESUME_TEXT
+
+    h = _headers(client, "13900002006")
+    assert _analyze(client, h).status_code == 201
+    weaker_resume = _RESUME_TEXT.replace("、LangGraph", "")
+    assert _analyze(
+        client, h, title="云原生后端工程师", resumeText=weaker_resume,
+    ).status_code == 201
+
+    data = _summary(client, h)
+    assert data["matchChanges"] == [], \
+        "同一份 JD 但换了目标岗位名，不得产出匹配度变化"
 
 
 def test_summary_is_user_scoped(client, careerly_store, graph_store, engine_live):

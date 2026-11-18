@@ -122,6 +122,18 @@ app.include_router(auth_router)
 from app.careerly.router import router as careerly_router
 app.include_router(careerly_router)
 
+
+# ── Careerly 启动恢复（P1-06）───────────────────────────────────────────────
+# ``asyncio.create_task`` 创建的协程无法跨进程存活。进程重启后数据库里
+# 可能残留 ``queued`` / ``processing`` 的任务 —— 它们不可能再被推进，
+# 必须显式标记为 ``failed`` / ``TASK_INTERRUPTED`` 并释放额度预占。
+# 第一阶段**不**自动重跑：没有可靠的恢复依据，重跑可能重复扣费。
+@app.on_event("startup")
+async def _careerly_recover_interrupted_tasks() -> None:
+    from app.careerly.router import recover_interrupted_tasks
+
+    recover_interrupted_tasks()
+
 # ── Global exception handlers (unified error envelope) ──────────────────────
 
 

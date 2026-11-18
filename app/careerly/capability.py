@@ -15,6 +15,15 @@ from app.utils.logger import logger
 MIN_DIMENSIONS = 3
 MAX_DIMENSIONS = 8
 
+#: 能力评分口径版本（P1-03）。
+#:
+#: 成长比较只允许在**同一口径**的快照之间进行。只要修改
+#: ``LLMService.score_capabilities`` 的提示词、维度定义或归一化规则，
+#: 就必须提升这个版本号 —— 旧快照会因此变成「不可比较」，
+#: 从而不再产出可能误导用户的能力提升 / 下降事件。
+#: 这是「不兼容的快照不生成差值事件」在数据层的锚点。
+SCORING_VERSION = "c4-cap-v1"
+
 
 def _clamp_score(value: Any) -> Optional[int]:
     """Coerce to int 0-100; accept float/str digits, reject anything else."""

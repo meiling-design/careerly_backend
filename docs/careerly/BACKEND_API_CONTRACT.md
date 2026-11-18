@@ -19,7 +19,7 @@
 | — | Flutter 契约 → 后端端点映射 | ✅ 已推导；实际对接范围见 **§0.5.1** |
 | C1 | **认证身份字段**：手机号（D85）vs 邮箱+密码 | ✅ **已裁决**：手机号直登，`DEV 可用 / PROD 硬阻断`（D-NEW 方案 A）。`app/core/auth_mode.py` 导入期 fail-fast |
 | C2 | 分析调用形态：同步 vs 异步 | ✅ **已裁决 D-A ②**：对外同步（Flutter 零改动），内部保留任务状态机便于升级异步。<br>**P1-1b（2026-10-05）落地「双模」**：同步端点保留不动，**新增**异步入口 `POST /analysis/tasks`（202 + 轮询）。Flutter 真实后端路径改走异步，Mock 路径仍走同步 —— 见 **§0.5.9** |
-| C3 | 额度规则 | ✅ **已落地**：`careerly.db: user_quota`（免费 3 次），仅分析**成功**后扣减，失败不扣 |
+| C3 | 额度规则 | ✅ **已落地**：`careerly.db: user_quota`（免费 3 次）。P1-03 起改为**任务开始时原子预占**（`reserved`），成功确认消耗、失败 / 取消 / 重启恢复释放 |
 | C4 | 能力分值模型缺失 | ✅ **已落地**：`LLMService.score_capabilities()` + `capability.normalize()` 严格校验 + 完整降级。🔧 **P1-5 修复了一处取值 bug**（见 §0.5.6） |
 | C5 | 会话持久化 → user_id 隔离无处落地 | ✅ **已落地**：**D-B 推翻 D52** —— token 安全持久化（Android Keystore / iOS Keychain），refresh 90 天。冷启动不再丢失身份主体 |
 
@@ -394,14 +394,38 @@ stepIndex      / totalSteps   产品步骤刻度（「正在分析」页的 5 �
   "projectId": "string",
   "version": 1,
   "resumeVersionId": "string | null",
+  "resumeVersionLabel": "string | null",
   "matches": [ <JobMatch> ],
   "capabilitySnapshot": { "产品规划": 85, "AI 应用能力": 76 },
+  "jobSnapshots": [ <JobSnapshot> ],
   "createdAt": "ISO8601 | null"
 }
 ```
 
-> ⚠️ `capabilitySnapshot`（能力名 → 0–100 分）与 `version` 是**「看见成长」的数据支点** ——
-> 后端现在**产不出这个 Map**（见 C4）。
+> `resumeVersionId` / `resumeVersionLabel`（P1-01）记录**这次分析实际使用**的
+> 简历版本，不是「当前简历」。内联 `resumeText` 且无对应版本时为 `null`。
+
+### 2.3.1 `JobSnapshot` JSON（P1-02）
+
+```json
+{
+  "jobId": "string",
+  "title": "string",
+  "company": "string",
+  "rawJd": "string",
+  "source": "paste | url | history | null",
+  "sourceUrl": "string | null",
+  "importMethod": "string | null",
+  "capturedAt": "ISO8601 | null",
+  "available": true
+}
+```
+
+> 每次分析成功时写入、**永不更新**。迁移前的历史结果没有快照行，
+> 后端返回 `available: false` —— 前端必须显示「原文缺失」，
+> **不得**回退到当前 `jobs.raw_jd` 冒充历史原文。
+
+> ⚠️ `capabilitySnapshot`（能力名 → 0–100 分）与 `version` 是**「看见成长」的数据支点**。
 
 ### 2.4 `JobMatch` JSON
 
@@ -436,8 +460,12 @@ stepIndex      / totalSteps   产品步骤刻度（「正在分析」页的 5 �
 ### 2.6 `QuotaState` JSON
 
 ```json
-{ "total": 3, "used": 0, "isMember": false }
+{ "total": 3, "used": 0, "reserved": 0, "isMember": false }
 ```
+
+> P1-03：`used` = 已确认消耗；`reserved` = 进行中任务已预占。
+> 剩余额度 = `total - used - reserved`。并发请求由 SQLite 条件 UPDATE
+> 原子预占，不会同时通过门禁。
 
 ### 2.7 `ResumeProfile` JSON
 
@@ -596,7 +624,10 @@ analysis_projects(id, user_id, name, created_at, updated_at)
 jobs(id, user_id, title, company, raw_jd, source, created_at)
 project_jobs(project_id, job_id)                       -- 引用，不级联删除
 analysis_results(id, project_id, version, resume_version_id,
-                 capability_snapshot JSON, created_at)
+                 resume_version_label, capability_snapshot JSON, created_at)
+-- P1-02：分析实际使用的 JD 原文快照（只追加、不更新）
+analysis_job_snapshots(id, result_id, job_id, title, company, raw_jd,
+                       source, source_url, import_method, captured_at, created_at)
 job_matches(result_id, job_id, score, rank, reasons JSON,
             suggestion, strength_scores JSON, gap_details JSON)
 
@@ -610,7 +641,7 @@ resume_baseline(user_id, work_experiences JSON, project_experiences JSON,
                 skills JSON, awards JSON, capabilities JSON, updated_at)
 
 -- 额度（对齐 QuotaState）
-user_quota(user_id, total, used, is_member)
+user_quota(user_id, total, used, reserved, is_member)
 ```
 
 `capability_snapshots` 是**成长模块的核心**：每次分析 / 每次简历更新写入一条，

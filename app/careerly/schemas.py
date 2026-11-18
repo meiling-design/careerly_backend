@@ -77,6 +77,26 @@ class JobMatch(BaseModel):
     gapDetails: list[GapDetail] = Field(default_factory=list)
 
 
+class JobSnapshot(BaseModel):
+    """一次分析实际使用的岗位原文快照（P1-02）。
+
+    ⚠️ **不可变**：快照在分析成功时写入，之后修改岗位信息、
+    重新解析链接都不会回写这里。``available=False`` 表示这是历史数据
+    （功能上线前的分析记录）—— 前端必须展示「原文缺失」，
+    **不得**回退到 ``jobs.raw_jd`` 冒充历史原文。
+    """
+
+    jobId: str
+    title: str = ""
+    company: str = ""
+    rawJd: str = ""
+    source: Optional[str] = None          # paste | url | history
+    sourceUrl: Optional[str] = None
+    importMethod: Optional[str] = None
+    capturedAt: Optional[str] = None
+    available: bool = True
+
+
 class AnalysisResult(BaseModel):
     """`analysis_result.dart` → ``AnalysisResult`` (versioned, never overwritten)."""
 
@@ -84,8 +104,12 @@ class AnalysisResult(BaseModel):
     projectId: str = ""
     version: int = 1
     resumeVersionId: Optional[str] = None
+    resumeVersionLabel: Optional[str] = None
     matches: list[JobMatch] = Field(default_factory=list)
     capabilitySnapshot: dict[str, int] = Field(default_factory=dict)
+    #: 本次分析实际使用的岗位原文快照（P1-02）。历史记录为空 /
+    #: ``available=False``，前端据此显示缺失态，**不**读当前岗位。
+    jobSnapshots: list[JobSnapshot] = Field(default_factory=list)
     createdAt: Optional[str] = None
 
 
@@ -105,10 +129,15 @@ class AnalysisProject(BaseModel):
 
 
 class QuotaState(BaseModel):
-    """`quota_state.dart` → ``QuotaState``."""
+    """`quota_state.dart` → ``QuotaState``.
+
+    ``reserved`` 是「已被进行中的分析任务预占、尚未确认消耗」的次数
+    （P1-03）。剩余额度 = ``total - used - reserved``。
+    """
 
     total: int = 3
     used: int = 0
+    reserved: int = 0
     isMember: bool = False
 
 
@@ -120,14 +149,20 @@ class QuotaState(BaseModel):
 class AnalyzeRequest(BaseModel):
     """`AnalysisRepository.analyze({required title, required rawJd})`.
 
-    ``resumeText`` is an **optional backend extension**: the Dart contract has
-    no resume parameter (it uses the user's current resume).  Until the resume
-    baseline is persisted (phase P3), the text can be supplied inline.
+    ``resumeText`` / ``company`` / ``source`` / ``sourceUrl`` 是
+    **可选后端扩展**：Dart 契约里没有这些字段，但 P1-02 的 JD 快照
+    需要记录「这次分析到底用了哪份岗位原文、从哪来」。
+    缺省值保持旧行为（粘贴 JD、无公司名）。
     """
 
     title: str = Field(..., min_length=1, max_length=200)
     rawJd: str = Field(..., min_length=1)
     resumeText: Optional[str] = None
+    company: str = ""
+    #: 导入方式：``paste`` / ``url`` / ``history``。
+    source: str = "paste"
+    #: 岗位链接导入时的原始 URL。
+    sourceUrl: Optional[str] = Field(default=None, max_length=2000)
 
 
 class ParseJobUrlRequest(BaseModel):

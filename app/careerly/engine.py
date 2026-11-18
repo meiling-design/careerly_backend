@@ -60,6 +60,34 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
+#: 多岗位能力评分的 JD 总预算（字符）。超过时按岗位顺序截断 ——
+#: 评分只看目标方向，不需要把每一份 JD 全文都塞进提示词。
+_CAPABILITY_JD_BUDGET = 12000
+
+
+def _capability_jd_text(job_texts: list[str]) -> str:
+    """把多份 JD 合成一次能力评分的输入。
+
+    单岗位时保持原文不变（与旧行为逐字一致）；多岗位时加岗位分隔头，
+    便于模型理解这是同一个人的几个目标方向，而不是一份超长 JD。
+    """
+    parts = [t.strip() for t in job_texts if t and t.strip()]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+
+    blocks: list[str] = []
+    budget = _CAPABILITY_JD_BUDGET
+    for i, text in enumerate(parts):
+        if budget <= 0:
+            break
+        block = f"【目标岗位 {i + 1}】\n{text}"[:budget]
+        blocks.append(block)
+        budget -= len(block)
+    return "\n\n".join(blocks)
+
+
 def _score_capabilities_safe(resume: Any, raw_jd: str) -> Optional[list[dict]]:
     """C4: one LLM call for capability scores; any failure degrades to None.
 
@@ -123,13 +151,20 @@ def to_job_match(result: MatchResult, job_id: str, rank: int) -> JobMatch:
 
 def build_project(
     *,
-    title: str,
-    raw_jd: str,
+    title: str = "",
+    raw_jd: str = "",
+    jobs: Optional[list[dict]] = None,
     match_results: list[MatchResult],
     source: str = "paste",
     capabilities: Optional[list[dict]] = None,
 ) -> AnalysisProject:
     """Assemble a version-1 ``AnalysisProject`` from engine results.
+
+    多岗位（2026-11-18）：``jobs`` 是
+    ``[{"title", "rawJd", "company", "source", "sourceUrl"}, …]``。
+    每个岗位生成一条 ``JobModel``；引擎返回的每条 ``MatchResult``
+    按其 JD 原文映射回对应岗位，``rank`` 在**全部岗位之间**统一排名。
+    未传 ``jobs`` 时回退到单岗位 ``title`` / ``raw_jd``（向后兼容）。
 
     ``capabilities`` (C4, optional) is the validated output of
     :mod:`app.careerly.capability` — when present it fills
@@ -138,21 +173,50 @@ def build_project(
     (empty / null / {}).
     """
     now = time.time()
-    job_id = _new_id("job")
-    job = JobModel(
-        id=job_id,
-        title=title.strip(),
-        company="",           # request has no company field (D85-era contract)
-        rawJd=raw_jd,
-        source=source,
-        createdAt=iso(now),
-    )
+    job_inputs = list(jobs) if jobs else [
+        {"title": title, "rawJd": raw_jd, "company": "", "source": source}
+    ]
+
+    # 同一份 JD 只建一个岗位（引擎侧 deduplicate 后也只会返回一条匹配）。
+    job_models: list[JobModel] = []
+    seen_raw: set[str] = set()
+    for inp in job_inputs:
+        raw = str(inp.get("rawJd") or "")
+        key = raw.strip()
+        if key in seen_raw:
+            continue
+        seen_raw.add(key)
+        job_models.append(
+            JobModel(
+                id=_new_id("job"),
+                title=str(inp.get("title") or "").strip(),
+                company=str(inp.get("company") or "").strip(),
+                rawJd=raw,
+                source=str(inp.get("source") or source),
+                createdAt=iso(now),
+            )
+        )
+    if not job_models:  # 理论上 AnalyzeRequest 已拦掉；这里只防御空列表
+        job_models.append(
+            JobModel(
+                id=_new_id("job"), title=title.strip(), company="",
+                rawJd=raw_jd, source=source, createdAt=iso(now),
+            )
+        )
+    by_raw = {(j.rawJd or "").strip(): j for j in job_models}
 
     ordered = sorted(match_results, key=lambda r: r.score, reverse=True)
-    matches = [
-        to_job_match(r, job_id=job_id, rank=i + 1)
-        for i, r in enumerate(ordered)
-    ]
+    matches = []
+    fallback_index = 0
+    for i, r in enumerate(ordered):
+        description = (getattr(getattr(r, "job", None), "description", "") or "").strip()
+        job = by_raw.get(description)
+        if job is None:
+            # 兜底：引擎可能对 JD 做了轻微改写（如去空白）。按结果顺序
+            # 分配给尚未用过的岗位，保证每条匹配都有可点击的岗位卡。
+            job = job_models[min(fallback_index, len(job_models) - 1)]
+            fallback_index += 1
+        matches.append(to_job_match(r, job_id=job.id, rank=i + 1))
 
     result = AnalysisResult(
         id=_new_id("res"),
@@ -170,10 +234,14 @@ def build_project(
     project_id = _new_id("proj")
     result.projectId = project_id
 
+    project_name = job_models[0].title or "新目标岗位"
+    if len(job_models) > 1:
+        project_name = f"{project_name} 等 {len(job_models)} 个岗位"
+
     return AnalysisProject(
         id=project_id,
-        name=title.strip(),
-        jobs=[job],
+        name=project_name,
+        jobs=job_models,
         results=[result],
         createdAt=iso(now),
         updatedAt=iso(now),
@@ -218,15 +286,20 @@ def _apply_capabilities(result: AnalysisResult, capabilities: list[dict]) -> Non
 
 def run_analysis(
     *,
-    title: str,
-    raw_jd: str,
+    title: str = "",
+    raw_jd: str = "",
+    jobs: Optional[list[dict]] = None,
     resume_text: str,
     use_llm: bool = True,
     use_embedding: bool = True,
     session_id: str | None = None,
     cancel_check: Callable[[], bool] | None = None,
 ) -> tuple[AnalysisProject, dict]:
-    """Run the matching engine for one pasted JD and map it to a project.
+    """Run the matching engine for one or more pasted JDs.
+
+    多岗位（2026-11-18）：``jobs`` 优先；未传时回退到单岗位
+    ``title`` / ``raw_jd``。所有 JD 在**同一次引擎运行**中匹配，
+    结果按匹配度跨岗位排名。
 
     Returns ``(project, resume_profile)`` where ``resume_profile`` is the
     engine's parsed resume (``ResumeProfile.model_dump()``, possibly ``{}``).
@@ -261,6 +334,11 @@ def run_analysis(
             422,
         )
 
+    job_inputs = list(jobs) if jobs else [
+        {"title": title, "rawJd": raw_jd, "company": "", "source": "paste"}
+    ]
+    job_texts = [str(j.get("rawJd") or "") for j in job_inputs]
+
     graph = DecisionGraph()
     started = time.time()
 
@@ -268,7 +346,7 @@ def run_analysis(
         state = graph.run_sync(
             job_urls=[],
             resume_text=resume_text,
-            manual_job_texts=[raw_jd],
+            manual_job_texts=job_texts,
             use_llm=use_llm,
             use_embedding=use_embedding,
             session_id=session_id,
@@ -314,9 +392,12 @@ def run_analysis(
     # try 块里，于是它会一路冒到 router 的兜底分支，把一次**已经成功**的
     # 分析变成 502。这个 bug 潜伏到 P1-5 才被发现，正因为没有测试真的跑引擎。
     resume_profile = getattr(state, "resume_output", None)
-    capabilities = _score_capabilities_safe(resume_profile, raw_jd) if resume_profile else None
+    capabilities = (
+        _score_capabilities_safe(resume_profile, _capability_jd_text(job_texts))
+        if resume_profile else None
+    )
     project = build_project(
-        title=title, raw_jd=raw_jd, match_results=results, capabilities=capabilities,
+        jobs=job_inputs, match_results=results, capabilities=capabilities,
     )
     # P3-1：把画像序列化后交给调用方持久化（职业资产的真实数据源）。
     # 失败不得影响分析 —— 与成长记录同一纪律。

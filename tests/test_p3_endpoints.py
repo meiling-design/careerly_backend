@@ -168,6 +168,7 @@ def test_summary_before_analysis_is_neutral_not_fabricated(client, careerly_stor
     assert data["hasBaseline"] is False
     assert data["suggestions"] == [], "没有分析就不得产出建议"
     assert data["matchChanges"] == []
+    assert data["latestTopScore"] is None
     assert data["recentGrowth"] == []
     assert data["dailyContent"] is None, "无数据来源，必须为 null 而非占位文案"
     assert "职业基线" in data["headline"]
@@ -190,6 +191,7 @@ def test_summary_after_first_analysis(client, careerly_store, graph_store,
     data = _summary(client, h)
 
     assert data["hasBaseline"] is True
+    assert isinstance(data["latestTopScore"], int) and data["latestTopScore"] > 0
     assert "分" in data["headline"], f"headline 未包含匹配分：{data['headline']}"
     assert data["subheadline"], "subheadline 不应为空"
 
@@ -206,6 +208,20 @@ def test_summary_after_first_analysis(client, careerly_store, graph_store,
 
     # 只有一条快照 → 没有可比的前一条 → 不得产出 matchChange
     assert data["matchChanges"] == [], "首次分析没有对比基准，不得产出变化"
+
+
+def test_home_latest_top_score_comes_from_highest_match_in_latest_result():
+    from types import SimpleNamespace
+
+    from app.careerly.home import _latest_top_match
+
+    old_result = SimpleNamespace(matches=[SimpleNamespace(score=99)])
+    latest_result = SimpleNamespace(
+        matches=[SimpleNamespace(score=42), SimpleNamespace(score=83)]
+    )
+    project = SimpleNamespace(results=[old_result, latest_result])
+
+    assert _latest_top_match(project).score == 83
 
 
 def test_summary_match_change_after_second_analysis(client, careerly_store,

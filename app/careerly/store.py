@@ -1028,7 +1028,7 @@ class CareerlyStore:
         session_id: str | None = None,
         resume_version_id: str | None = None,
         resume_version_label: str | None = None,
-        jd_snapshot: dict[str, Any] | None = None,
+        jd_snapshot: Any = None,
     ) -> str:
         """Insert a ``queued`` task and return its id.
 

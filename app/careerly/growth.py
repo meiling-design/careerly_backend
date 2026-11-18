@@ -75,14 +75,30 @@ def job_key(title: str, company: str) -> str:
     return _fingerprint(normalized)
 
 
-def _snapshot_meta(project: AnalysisProject) -> dict[str, Any]:
-    """从分析结果里取「本次分析实际用了哪份 JD」。"""
+def _snapshot_meta(project: AnalysisProject, job_id: str | None = None) -> dict[str, Any]:
+    """从分析结果里取「本次分析实际用了哪份 JD」。
+
+    多岗位（2026-11-18）：传入 ``job_id``（通常是排名第一的匹配）时
+    优先取**那个岗位**的快照 —— 成长里的匹配度变化属于榜首岗位，
+    不能拿第一个岗位的 JD 冒充。
+    """
     if not project.results:
         return {}
     result = project.results[-1]
-    snap = next(
-        (s for s in result.jobSnapshots if getattr(s, "available", False)), None
-    )
+    snap = None
+    if job_id:
+        snap = next(
+            (
+                s
+                for s in result.jobSnapshots
+                if getattr(s, "available", False) and s.jobId == job_id
+            ),
+            None,
+        )
+    if snap is None:
+        snap = next(
+            (s for s in result.jobSnapshots if getattr(s, "available", False)), None
+        )
     job = None
     if snap is not None:
         job = next((j for j in project.jobs if j.id == snap.jobId), None)
@@ -132,7 +148,7 @@ def build_scores_payload(
         if result.matches:
             top = min(result.matches, key=lambda m: m.rank or 1)
             match_score = top.score
-            meta = _snapshot_meta(project)
+            meta = _snapshot_meta(project, top.jobId)
             match_meta = {
                 "jobId": meta.get("jobId") or top.jobId,
                 "jobKey": job_key(meta.get("title", ""), meta.get("company", "")),

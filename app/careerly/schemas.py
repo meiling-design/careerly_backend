@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -146,23 +146,70 @@ class QuotaState(BaseModel):
 # ══════════════════════════════════════════════════════════════════════════
 
 
-class AnalyzeRequest(BaseModel):
-    """`AnalysisRepository.analyze({required title, required rawJd})`.
+class AnalyzeJobInput(BaseModel):
+    """一次分析中的**一个**目标岗位（多岗分析，2026-11-18）。
 
-    ``resumeText`` / ``company`` / ``source`` / ``sourceUrl`` 是
-    **可选后端扩展**：Dart 契约里没有这些字段，但 P1-02 的 JD 快照
-    需要记录「这次分析到底用了哪份岗位原文、从哪来」。
-    缺省值保持旧行为（粘贴 JD、无公司名）。
+    多岗位分析把若干岗位放进同一个请求：引擎一次性对全部岗位打分，
+    返回一个 project 下的多个 job + 多条 match，匹配度跨岗位排名。
+    额度按**一次分析**扣减，不按岗位数扣。
     """
 
     title: str = Field(..., min_length=1, max_length=200)
     rawJd: str = Field(..., min_length=1)
+    company: str = ""
+    #: 导入方式：``paste`` / ``url`` / ``history``。
+    source: str = "paste"
+    #: 岗位链接导入时的原始 URL。
+    sourceUrl: Optional[str] = Field(default=None, max_length=2000)
+
+
+class AnalyzeRequest(BaseModel):
+    """`AnalysisRepository.analyze({jobs})` / 旧的 ``{title, rawJd}``。
+
+    **多岗位**：优先使用 ``jobs``（每个元素见 [AnalyzeJobInput]）。
+    **单岗位向后兼容**：只给 ``title`` + ``rawJd`` 时等价于
+    ``jobs=[{title, rawJd, company, source, sourceUrl}]`` —— 老客户端
+    与既有测试无需改动。
+
+    ``resumeText`` / ``company`` / ``source`` / ``sourceUrl`` 是
+    **可选后端扩展**：Dart 契约里没有这些字段，但 P1-02 的 JD 快照
+    需要记录「这次分析到底用了哪份岗位原文、从哪来」。
+    """
+
+    title: Optional[str] = Field(default=None, max_length=200)
+    rawJd: Optional[str] = None
     resumeText: Optional[str] = None
     company: str = ""
     #: 导入方式：``paste`` / ``url`` / ``history``。
     source: str = "paste"
     #: 岗位链接导入时的原始 URL。
     sourceUrl: Optional[str] = Field(default=None, max_length=2000)
+    #: 多岗位输入（2026-11-18）。为空时回退到单岗位字段。
+    jobs: Optional[list[AnalyzeJobInput]] = None
+
+    @model_validator(mode="after")
+    def _require_at_least_one_job(self) -> "AnalyzeRequest":
+        if self.jobs:
+            return self
+        if not (self.title or "").strip() or not (self.rawJd or "").strip():
+            raise ValueError(
+                "必须提供 jobs（至少一个岗位），或同时提供 title 与 rawJd"
+            )
+        return self
+
+    def resolved_jobs(self) -> list[AnalyzeJobInput]:
+        """把两种请求形态归一成岗位列表。"""
+        if self.jobs:
+            return list(self.jobs)
+        return [
+            AnalyzeJobInput(
+                title=(self.title or "").strip(),
+                rawJd=self.rawJd or "",
+                company=self.company,
+                source=self.source,
+                sourceUrl=self.sourceUrl,
+            )
+        ]
 
 
 class ParseJobUrlRequest(BaseModel):
@@ -389,6 +436,7 @@ class HomeSummary(BaseModel):
 
     headline: str = ""
     subheadline: str = ""
+    latestTopScore: Optional[int] = None
     suggestions: list[str] = Field(default_factory=list)
     matchChanges: list[MatchChange] = Field(default_factory=list)
     recentGrowth: list[str] = Field(default_factory=list)

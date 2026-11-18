@@ -348,7 +348,8 @@ class _PreparedAnalysis:
         resume_text: str | None = None,
         resume_version_id: str | None = None,
         resume_version_label: str | None = None,
-        jd_snapshot: dict[str, Any] | None = None,
+        jobs: list[dict[str, Any]] | None = None,
+        jd_snapshots: list[dict[str, Any]] | None = None,
     ):
         self.failure = failure
         self.task_id = task_id
@@ -356,7 +357,10 @@ class _PreparedAnalysis:
         self.resume_text = resume_text
         self.resume_version_id = resume_version_id
         self.resume_version_label = resume_version_label
-        self.jd_snapshot = jd_snapshot
+        #: 本次分析的岗位入参（引擎 ``run_analysis(jobs=...)`` 用）。
+        self.jobs = jobs or []
+        #: 与 ``jobs`` 一一对应的 JD 快照（P1-02，多岗位时为多条）。
+        self.jd_snapshots = jd_snapshots or []
 
 
 def _prepare_task(
@@ -387,15 +391,33 @@ def _prepare_task(
     """
     session_id = StateStore.new_session_id()
     captured_at = iso(time.time())
-    jd_snapshot = {
-        "title": req.title.strip(),
-        "company": (req.company or "").strip(),
-        "rawJd": req.rawJd,
-        "source": req.source or "paste",
-        "sourceUrl": req.sourceUrl,
-        "importMethod": req.source or "paste",
-        "capturedAt": captured_at,
-    }
+    job_inputs = req.resolved_jobs()
+    jd_snapshots = [
+        {
+            "title": job.title.strip(),
+            "company": (job.company or "").strip(),
+            "rawJd": job.rawJd,
+            "source": job.source or "paste",
+            "sourceUrl": job.sourceUrl,
+            "importMethod": job.source or "paste",
+            "capturedAt": captured_at,
+        }
+        for job in job_inputs
+    ]
+    jobs = [
+        {
+            "title": snap["title"],
+            "company": snap["company"],
+            "rawJd": snap["rawJd"],
+            "source": snap["source"],
+            "sourceUrl": snap["sourceUrl"],
+        }
+        for snap in jd_snapshots
+    ]
+    # 项目 / 任务名取首个岗位；多岗位时补上数量，历史列表一眼可辨。
+    task_title = jd_snapshots[0]["title"] or "新目标岗位"
+    if len(jd_snapshots) > 1:
+        task_title = f"{task_title} 等 {len(jd_snapshots)} 个岗位"
 
     # 简历来源：内联文本优先；否则用当前简历版本（同时拿到版本 id）。
     # 内联文本没有版本 id —— 它本来就不是「用户简历库里的某一版」，
@@ -417,12 +439,12 @@ def _prepare_task(
 
     task_id = store.create_task(
         user_id,
-        req.title,
-        source=req.source or "paste",
+        task_title,
+        source=jd_snapshots[0]["source"],
         session_id=session_id,
         resume_version_id=resume_version_id,
         resume_version_label=resume_version_label,
-        jd_snapshot=jd_snapshot,
+        jd_snapshot={"jobs": jd_snapshots},
     )
 
     # Quota gate (Baseline §5 / PRD §16): free users get 3 analyses total.
@@ -452,7 +474,8 @@ def _prepare_task(
         resume_text=resume_text,
         resume_version_id=resume_version_id,
         resume_version_label=resume_version_label,
-        jd_snapshot=jd_snapshot,
+        jobs=jobs,
+        jd_snapshots=jd_snapshots,
     )
 
 
@@ -462,12 +485,11 @@ async def _execute_analysis(
     user_id: int,
     task_id: str,
     session_id: str,
-    title: str,
-    raw_jd: str,
+    jobs: list[dict[str, Any]],
     resume_text: str,
     resume_version_id: str | None = None,
     resume_version_label: str | None = None,
-    jd_snapshot: dict[str, Any] | None = None,
+    jd_snapshots: list[dict[str, Any]] | None = None,
     cancel_check: Any = None,
 ):
     """跑引擎并把成功产物落库；返回 ``AnalysisProject``。
@@ -485,8 +507,7 @@ async def _execute_analysis(
             None,
             partial(
                 run_analysis,
-                title=title,
-                raw_jd=raw_jd,
+                jobs=jobs,
                 resume_text=resume_text,
                 session_id=session_id,
                 cancel_check=cancel_check,
@@ -506,23 +527,39 @@ async def _execute_analysis(
 
     # P1-01 / P1-02：把「本次实际使用的简历版本 + JD 原文」绑定到
     # 结果记录上。这些值来自任务创建时的快照，不会再被后续修改影响。
+    snapshots_by_raw = {
+        (snap.get("rawJd") or "").strip(): snap
+        for snap in (jd_snapshots or [])
+    }
     for result in project.results:
         result.resumeVersionId = resume_version_id
         result.resumeVersionLabel = resume_version_label
-        if jd_snapshot:
+        if jd_snapshots:
+            # 多岗位：快照与 job 一一对应。
+            #
+            # 正常情况下数量相同、顺序相同（``build_project`` 按输入顺序
+            # 建 job）。只有输入里出现重复 JD 时引擎会去重，数量不等 ——
+            # 此时按 JD 原文对回，去重掉的那条没有 job 也就不需要快照。
+            if len(jd_snapshots) == len(project.jobs):
+                pairs = list(zip(project.jobs, jd_snapshots))
+            else:
+                pairs = [
+                    (job, snapshots_by_raw.get((job.rawJd or "").strip()) or {})
+                    for job in project.jobs
+                ]
             result.jobSnapshots = [
                 JobSnapshot(
                     jobId=job.id,
-                    title=jd_snapshot.get("title", job.title),
-                    company=jd_snapshot.get("company", job.company),
-                    rawJd=jd_snapshot.get("rawJd", raw_jd),
-                    source=jd_snapshot.get("source"),
-                    sourceUrl=jd_snapshot.get("sourceUrl"),
-                    importMethod=jd_snapshot.get("importMethod"),
-                    capturedAt=jd_snapshot.get("capturedAt"),
+                    title=snap.get("title", job.title),
+                    company=snap.get("company", job.company),
+                    rawJd=snap.get("rawJd", job.rawJd),
+                    source=snap.get("source"),
+                    sourceUrl=snap.get("sourceUrl"),
+                    importMethod=snap.get("importMethod"),
+                    capturedAt=snap.get("capturedAt"),
                     available=True,
                 )
-                for job in project.jobs
+                for job, snap in pairs
             ]
 
     store.save_project(user_id, project)
@@ -599,12 +636,11 @@ async def analyze(
             user_id=user_id,
             task_id=task_id,
             session_id=session_id,
-            title=req.title,
-            raw_jd=req.rawJd,
+            jobs=prepared.jobs,
             resume_text=prepared.resume_text or "",
             resume_version_id=prepared.resume_version_id,
             resume_version_label=prepared.resume_version_label,
-            jd_snapshot=prepared.jd_snapshot,
+            jd_snapshots=prepared.jd_snapshots,
         )
     except AnalysisError as exc:
         # P1-2：失败必须落库，消灭「失败无痕」。
@@ -666,12 +702,11 @@ async def start_analysis_task(
                 user_id=user_id,
                 task_id=task_id,
                 session_id=session_id,
-                title=req.title,
-                raw_jd=req.rawJd,
+                jobs=prepared.jobs,
                 resume_text=prepared.resume_text or "",
                 resume_version_id=prepared.resume_version_id,
                 resume_version_label=prepared.resume_version_label,
-                jd_snapshot=prepared.jd_snapshot,
+                jd_snapshots=prepared.jd_snapshots,
                 cancel_check=cancel_event.is_set,
             )
         except AnalysisCancelled:

@@ -7,6 +7,7 @@ every field must trace to something real. This module owns that traceability:
 |---|---|---|
 | ``headline`` | latest analysis capability set | neutral fallback |
 | ``subheadline`` | latest match score + capability count | neutral fallback |
+| ``latestTopScore`` | highest score in the newest analysis result | ``null`` |
 | ``suggestions`` | latest ``AnalysisResult`` gaps' actions | ``[]`` |
 | ``matchChanges`` | adjacent snapshots' ``matchScore`` diff | ``[]`` |
 | ``recentGrowth`` | newest ``growth_events`` titles | ``[]`` |
@@ -56,6 +57,13 @@ def _latest_result(project: Any) -> Optional[Any]:
     return project.results[-1]
 
 
+def _latest_top_match(project: Any) -> Optional[Any]:
+    result = _latest_result(project)
+    if result is None or not result.matches:
+        return None
+    return max(result.matches, key=lambda match: match.score)
+
+
 def _baseline_text(store: Any, user_id: int) -> str:
     saved = store.get_resume(user_id) or {}
     return (saved.get("text") or "").strip()
@@ -93,23 +101,18 @@ def _headline(project: Any, capabilities: list[dict]) -> tuple[str, str]:
     if project is None:
         return _NO_BASELINE_HEADLINE, _NO_BASELINE_SUBHEADLINE
 
-    result = _latest_result(project)
-    score: Optional[int] = None
-    if result is not None and result.matches:
-        score = result.matches[0].score
-
-    if score is None:
+    top_match = _latest_top_match(project)
+    if top_match is None:
         return "已完成职业基线", "继续分析目标岗位，看能力与目标的差距"
 
     top_gap = ""
-    if result is not None and result.matches:
-        for gap in result.matches[0].gapDetails:
-            name = (gap.name or "").strip()
-            if name:
-                top_gap = name
-                break
+    for gap in top_match.gapDetails:
+        name = (gap.name or "").strip()
+        if name:
+            top_gap = name
+            break
 
-    headline = f"当前与目标岗位的匹配度 {score} 分"
+    headline = f"当前与目标岗位的匹配度 {top_match.score} 分"
     if top_gap:
         subheadline = f"最需要补上的是「{top_gap}」"
     elif capabilities:
@@ -185,10 +188,12 @@ def build_home_summary(store: Any, user_id: int) -> HomeSummary:
     project = _latest_project(store, user_id)
     capabilities = store.list_capabilities(user_id) if project is not None else []
     headline, subheadline = _headline(project, capabilities)
+    top_match = _latest_top_match(project)
 
     return HomeSummary(
         headline=headline,
         subheadline=subheadline,
+        latestTopScore=top_match.score if top_match is not None else None,
         suggestions=_suggestions_from(project),
         matchChanges=_match_changes(store, user_id),
         recentGrowth=_recent_growth(store, user_id),

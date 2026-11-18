@@ -83,7 +83,7 @@
 | `GrowthRepository.fetchEvents` | `GET /api/v1/growth/events?type=&limit=` | JWT | 相邻能力快照 diff 派生（P2-4/5，已上线） |
 | `GrowthRepository.fetchTimeline` | `GET /api/v1/growth/timeline?from=&to=` | JWT | 同上 |
 | `CareerAssetsRepository.fetchAssets` | `GET /api/v1/career/assets` | JWT | 最新分析持久化的结构化简历画像 + 最新/次新能力快照 diff（`app/careerly/assets.py`）。时间字段只填真实可得项，解析不到的留空，**不伪造** |
-| `HomeRepository.fetchSummary` | `GET /api/v1/home/summary` | JWT | headline/建议由最新分析匹配分与真实 Gap 派生；`dailyContent` 无来源，下发 `null`（`app/careerly/home.py`） |
+| `HomeRepository.fetchSummary` | `GET /api/v1/home/summary` | JWT | `latestTopScore` 是最新一次分析中的最高匹配分，独立于只记录分数变化的 `matchChanges`；headline/建议由最新分析与真实 Gap 派生；`dailyContent` 无来源，下发 `null`（`app/careerly/home.py`） |
 | `ProfileRepository.fetchUserProfile` | `GET /api/v1/profile` | JWT | auth.db users 表；`handle` 为**脱敏**手机号（`139****0002`），完整号码不下发（`app/careerly/identity.py`） |
 
 > **P2 事件派生口径（2026-10-01 裁决）**：事件由「相邻两条 `capability_snapshots`
@@ -284,7 +284,7 @@ POST /api/v1/ai/messages          Authorization: Bearer <JWT>
 | `AnalysisRepository.fetchProjects()` | `GET /api/v1/analysis/projects` | `[AnalysisProject]` |
 | `AnalysisRepository.fetchProject(id)` | `GET /api/v1/analysis/projects/{id}` | `AnalysisProject \| null` |
 | `AnalysisRepository.fetchJobLibrary()` | `GET /api/v1/analysis/jobs` | `[Job]` |
-| `AnalysisRepository.analyze({title, rawJd})` | `POST /api/v1/analysis` | `AnalysisProject` |
+| `AnalysisRepository.analyze({title, rawJd, jobs?})` | `POST /api/v1/analysis` | `AnalysisProject` |
 | `AnalysisRepository.fetchQuota()` | `GET /api/v1/analysis/quota` | `QuotaState` |
 | `ResumeRepository.fetchProfile()` | `GET /api/v1/resume/profile` | `ResumeProfile` |
 | `ResumeRepository.fetchVersions()` | `GET /api/v1/resume/versions` | `[ResumeVersion]` |
@@ -308,25 +308,59 @@ POST /api/v1/ai/messages          Authorization: Bearer <JWT>
 
 ## 2. 请求 / 响应 JSON 契约（逐字段对齐 Dart）
 
-### 2.1 `POST /api/v1/analysis`（核心 · 单岗位分析）
+### 2.1 `POST /api/v1/analysis`（核心 · 单 / 多岗位分析）
 
-**Request**
+**Request（多岗位，2026-11-18 起）**
+
+```json
+{
+  "jobs": [
+    { "title": "AI 产品经理", "rawJd": "<岗位 JD 原文>",
+      "company": "某某科技", "source": "paste", "sourceUrl": null },
+    { "title": "云原生后端工程师", "rawJd": "<岗位 JD 原文>",
+      "company": "", "source": "url", "sourceUrl": "https://…" }
+  ]
+}
+```
+
+**Request（单岗位，向后兼容）**
 
 ```json
 { "title": "AI 产品经理", "rawJd": "<岗位 JD 原文>" }
 ```
 
-对应 `AnalysisRepository.analyze({required String title, required String rawJd})`。
-→ 后端必须走 `GraphState.manual_job_texts` 分支构造 `JobPosting`，**不得要求 URL**。
+对应 `AnalysisRepository.analyze({title, rawJd, jobs?})`：
 
-**Response**：`AnalysisProject`（见 §3.1）。
+- `jobs` 非空时**优先**使用，元素见下；为空时回退到 `title` + `rawJd`
+  并归一成单元素列表 —— 老客户端与既有测试无需改动。
+- 一次分析对**全部岗位**统一匹配，`AnalysisResult.matches` 按匹配度
+  跨岗位排名（`rank` 从 1 开始）。
+- 额度按**一次分析**扣减，**不按岗位数**扣。
+- 每个岗位在同一个 `AnalysisProject.jobs` 下各生成一条 `Job`，
+  并在结果中带一一对应的 `jobSnapshots`（P1-02）。
+- 后端必须走 `GraphState.manual_job_texts` 分支构造岗位，**不得要求 URL**。
+
+**`jobs[]` 元素（`AnalyzeJobInput`）**
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `title` | string | ✅ | 岗位名；粘贴 JD 时取首行（≤200 字） |
+| `rawJd` | string | ✅ | JD 原文；不得为空 |
+| `company` | string | — | 公司名，缺省空串 |
+| `source` | string | — | `paste` / `url` / `history`，缺省 `paste` |
+| `sourceUrl` | string? | — | 岗位链接导入时的原始 URL |
+
+`jobs` 与 `title`/`rawJd` 至少提供一组；两者都没有时返回 `422`。
+
+**Response**：`AnalysisProject`（见 §3.1），`jobs.length` 即本次目标岗位数。
 
 ### 2.1b `POST /api/v1/analysis/tasks`（P1-1b · 异步入口）
 
-与 §2.1 **同一个请求体**，但**立刻**返回 `202`，分析在后台跑。
+与 §2.1 **同一个请求体**（单岗位 `title`/`rawJd` 或多岗位 `jobs`），
+但**立刻**返回 `202`，分析在后台跑。
 
 ```json
-{ "title": "AI 产品经理", "rawJd": "<岗位 JD 原文>" }
+{ "jobs": [ { "title": "AI 产品经理", "rawJd": "<岗位 JD 原文>" } ] }
 
 → 202
 { "success": true, "data": { "taskId": "task_…", "status": "processing" }, … }
@@ -517,6 +551,7 @@ stepIndex      / totalSteps   产品步骤刻度（「正在分析」页的 5 �
 ```json
 {
   "headline": "string", "subheadline": "string",
+  "latestTopScore": "int | null",
   "suggestions": ["string"],
   "matchChanges": [ { "jobId": "string", "jobTitle": "string", "company": "string | null",
                       "score": 86, "delta": 8 } ],

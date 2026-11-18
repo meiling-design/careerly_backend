@@ -382,6 +382,53 @@ def test_analysis_runs_the_real_decision_graph(
     assert "Kubernetes" in top["gaps"], "简历没有 K8s，必须算成 Gap"
 
 
+def test_multi_job_analysis_returns_every_job(
+    client, careerly_store, graph_store, engine_live
+):
+    """一次分析可以同时匹配多个目标岗位（2026-11-18）。
+
+    验证四件事：
+
+    1. 引擎收到的是**全部的** JD（不是只取第一条）；
+    2. 返回项目里每个岗位各有一条 job + 一条 match；
+    3. 匹配度在全部岗位之间统一排名；
+    4. 每条匹配都带得上自己岗位的 JD 快照（P1-02）。
+    """
+    second_jd = (
+        "云原生后端工程师\n"
+        "负责 Kubernetes 平台建设与稳定性治理。\n"
+        "任职要求：精通 Kubernetes、Docker；熟悉 Python；有服务网格经验。"
+    )
+    h = _headers(client, "13900001011")
+    r = _analyze(
+        client, h,
+        jobs=[
+            {"title": "AI 产品经理", "rawJd": _RAW_JD, "source": "paste"},
+            {"title": "云原生后端工程师", "rawJd": second_jd, "source": "paste"},
+        ],
+        title=None,
+        rawJd=None,
+    )
+    assert r.status_code == 201, r.text
+    data = r.json()["data"]
+
+    assert len(data["jobs"]) == 2, data["jobs"]
+    assert {j["title"] for j in data["jobs"]} == {"AI 产品经理", "云原生后端工程师"}
+
+    result = data["results"][0]
+    assert len(result["matches"]) == 2, result["matches"]
+    assert sorted(m["rank"] for m in result["matches"]) == [1, 2]
+    assert {m["jobId"] for m in result["matches"]} == {j["id"] for j in data["jobs"]}
+
+    snapshots = {s["title"]: s for s in result["jobSnapshots"]}
+    assert set(snapshots) == {"AI 产品经理", "云原生后端工程师"}
+    assert all(s["available"] and s["rawJd"] for s in snapshots.values())
+
+    # 引擎确实拿到两份 JD（而不是只传第一条）
+    session_id = str(graph_store.list_sessions(limit=10)[0]["session_id"])
+    assert graph_store.load_jobs(session_id).total_count == 2
+
+
 def test_llm_router_branch_is_exercised(client, careerly_store, graph_store, engine_live):
     """``use_llm=True`` 时 routing 节点会真的去问 LLM Router（不是纯规则）。"""
     _analyze(client, _headers(client, "13900001002"))
@@ -509,8 +556,9 @@ def test_llm_outage_does_not_half_succeed(
 #:
 #: ``cancel_check`` 是协作式取消回调（P1-05 / 退出分析），同样不含用户身份；
 #: 它只是让引擎在节点边界检查一个进程内 Event。
+#: ``jobs`` 是多岗位入参（2026-11-18），只含岗位名 / JD 原文，不含用户身份。
 _ALLOWED_ENGINE_KWARGS = {
-    "title", "raw_jd", "resume_text", "session_id", "cancel_check",
+    "title", "raw_jd", "jobs", "resume_text", "session_id", "cancel_check",
 }
 
 #: 明确禁止出现在引擎入参里的身份字段。

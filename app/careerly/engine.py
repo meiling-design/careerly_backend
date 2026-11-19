@@ -188,7 +188,7 @@ def build_project(
         seen_raw.add(key)
         job_models.append(
             JobModel(
-                id=_new_id("job"),
+                id=str(inp.get("jobId") or "").strip() or _new_id("job"),
                 title=str(inp.get("title") or "").strip(),
                 company=str(inp.get("company") or "").strip(),
                 rawJd=raw,

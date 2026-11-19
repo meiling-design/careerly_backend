@@ -370,6 +370,13 @@ class CareerlyStore:
             (project.id, user_id, project.name, created, updated),
         )
 
+        # project_jobs 是「本次项目当前引用哪些岗位」，不是岗位实体删除。
+        # 更新后移除一个岗位只移除它的引用；jobs / 历史快照 / 匹配仍永久保留。
+        conn.execute(
+            "DELETE FROM project_jobs WHERE project_id = ?",
+            (project.id,),
+        )
+
         for pos, job in enumerate(project.jobs):
             conn.execute(
                 "INSERT OR REPLACE INTO jobs (id, user_id, title, company, raw_jd, source, created_at) "
@@ -442,6 +449,24 @@ class CareerlyStore:
         if row is None:
             return None
         return self._load_project(user_id, row)
+
+    def get_resume_version(self, user_id: int, version_id: str) -> dict[str, Any] | None:
+        """读取属于当前用户的指定简历版本。"""
+        self._ensure_resume_versions(user_id)
+        conn = _get_conn(self.db_path)
+        row = conn.execute(
+            "SELECT * FROM careerly_resume_versions "
+            "WHERE user_id = ? AND id = ?",
+            (user_id, version_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row["id"],
+            "label": f"V{row['seq']}",
+            "text": row["text"],
+            "profile": _unjson(row["profile"], {}),
+        }
 
     def _load_project(self, user_id: int, row: sqlite3.Row) -> AnalysisProject:
         conn = _get_conn(self.db_path)

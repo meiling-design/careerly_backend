@@ -142,6 +142,64 @@ def test_success_task_is_readable_by_id(client, careerly_store, monkeypatch):
     assert one.json()["data"]["taskId"] == task_id
 
 
+def test_update_analysis_appends_version_to_original_project(
+    client, careerly_store, monkeypatch
+):
+    monkeypatch.setattr(
+        careerly_router,
+        "run_analysis",
+        lambda **kw: (_fake_project(), {}),
+    )
+    h = _headers(client, "13900000022")
+    careerly_store.save_resume(
+        1,
+        "简历 V1",
+        {},
+    )
+    resume = careerly_store.get_current_resume_version(1)
+    assert resume is not None
+
+    created = client.post(
+        "/api/v1/analysis",
+        json={"title": "T", "rawJd": "D", "resumeText": "简历 V1"},
+        headers=h,
+    )
+    assert created.status_code == 201
+    project_id = created.json()["data"]["id"]
+
+    updated = client.post(
+        "/api/v1/analysis",
+        json={
+            "projectId": project_id,
+            "resumeVersionId": resume["id"],
+            "jobs": [
+                {
+                    "title": "T",
+                    "rawJd": "D",
+                    "jobId": created.json()["data"]["jobs"][0]["id"],
+                }
+            ],
+        },
+        headers=h,
+    )
+    assert updated.status_code == 201
+    project = updated.json()["data"]
+    assert project["id"] == project_id
+    assert [r["version"] for r in project["results"]] == [1, 2]
+    assert project["results"][-1]["resumeVersionId"] == resume["id"]
+
+    invalid_reference = client.post(
+        "/api/v1/analysis",
+        json={
+            "projectId": project_id,
+            "jobs": [{"title": "T", "rawJd": "D", "jobId": "foreign-job"}],
+        },
+        headers=h,
+    )
+    assert invalid_reference.status_code == 422
+    assert invalid_reference.json()["error"]["code"] == "INVALID_JOB_REFERENCE"
+
+
 # ── 2. 失败 → failed + errorCode（消灭「失败无痕」）──────────────────────────
 
 

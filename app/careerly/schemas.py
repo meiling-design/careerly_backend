@@ -156,6 +156,7 @@ class AnalyzeJobInput(BaseModel):
 
     title: str = Field(..., min_length=1, max_length=200)
     rawJd: str = Field(..., min_length=1)
+    jobId: Optional[str] = None
     company: str = ""
     #: 导入方式：``paste`` / ``url`` / ``history``。
     source: str = "paste"
@@ -179,6 +180,8 @@ class AnalyzeRequest(BaseModel):
     title: Optional[str] = Field(default=None, max_length=200)
     rawJd: Optional[str] = None
     resumeText: Optional[str] = None
+    projectId: Optional[str] = None
+    resumeVersionId: Optional[str] = None
     company: str = ""
     #: 导入方式：``paste`` / ``url`` / ``history``。
     source: str = "paste"

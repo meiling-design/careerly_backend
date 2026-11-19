@@ -62,6 +62,7 @@ from app.careerly.job_import import JobImportError, fetch_job_from_url
 from app.careerly.schemas import (
     AiMessageRequest,
     AnalyzeRequest,
+    AnalysisProject,
     JobSnapshot,
     ParseJobUrlRequest,
     dump,
@@ -350,6 +351,7 @@ class _PreparedAnalysis:
         resume_version_label: str | None = None,
         jobs: list[dict[str, Any]] | None = None,
         jd_snapshots: list[dict[str, Any]] | None = None,
+        project_id: str | None = None,
     ):
         self.failure = failure
         self.task_id = task_id
@@ -361,6 +363,7 @@ class _PreparedAnalysis:
         self.jobs = jobs or []
         #: 与 ``jobs`` 一一对应的 JD 快照（P1-02，多岗位时为多条）。
         self.jd_snapshots = jd_snapshots or []
+        self.project_id = project_id
 
 
 def _prepare_task(
@@ -411,8 +414,9 @@ def _prepare_task(
             "rawJd": snap["rawJd"],
             "source": snap["source"],
             "sourceUrl": snap["sourceUrl"],
+            "jobId": job_inputs[i].jobId,
         }
-        for snap in jd_snapshots
+        for i, snap in enumerate(jd_snapshots)
     ]
     # 项目 / 任务名取首个岗位；多岗位时补上数量，历史列表一眼可辨。
     task_title = jd_snapshots[0]["title"] or "新目标岗位"
@@ -425,17 +429,54 @@ def _prepare_task(
     resume_text = (req.resumeText or "").strip()
     resume_version_id: str | None = None
     resume_version_label: str | None = None
-    current = store.get_current_resume_version(user_id)
-    if not resume_text:
+    if req.resumeVersionId:
+        selected = store.get_resume_version(user_id, req.resumeVersionId)
+        if selected is None:
+            return _PreparedAnalysis(failure=err(
+                "RESUME_VERSION_NOT_FOUND",
+                "指定的简历版本不存在或不属于当前用户",
+                404,
+            ))
+        resume_version_id = selected["id"]
+        resume_version_label = selected["label"]
+        resume_text = (selected["text"] or "").strip()
+    elif not resume_text:
+        current = store.get_current_resume_version(user_id)
         if current is not None:
             resume_version_id = current.get("id")
             resume_version_label = current.get("label")
             resume_text = (current.get("text") or "").strip()
-    elif current is not None and (current.get("text") or "").strip() == resume_text:
-        # 内联文本与当前版本逐字相同 → 它就是那一版，可以安全绑定。
-        # 不同则视为 ad-hoc 文本，**不**绑定、也**不**回写当前简历。
-        resume_version_id = current.get("id")
-        resume_version_label = current.get("label")
+    else:
+        current = store.get_current_resume_version(user_id)
+        if current is not None and (current.get("text") or "").strip() == resume_text:
+            resume_version_id = current.get("id")
+            resume_version_label = current.get("label")
+
+    project_id = (req.projectId or "").strip() or None
+    if project_id is not None:
+        original = store.get_project(user_id, project_id)
+        if original is None:
+            return _PreparedAnalysis(failure=err(
+                "PROJECT_NOT_FOUND",
+                "指定的分析项目不存在或不属于当前用户",
+                404,
+            ))
+        project_job_ids = {job.id for job in original.jobs}
+        if any(
+            job.jobId is not None and job.jobId not in project_job_ids
+            for job in job_inputs
+        ):
+            return _PreparedAnalysis(failure=err(
+                "INVALID_JOB_REFERENCE",
+                "更新分析只能引用原项目中的岗位",
+                422,
+            ))
+    elif any(job.jobId is not None for job in job_inputs):
+        return _PreparedAnalysis(failure=err(
+            "INVALID_JOB_REFERENCE",
+            "稳定岗位 ID 仅能用于更新已有分析项目",
+            422,
+        ))
 
     task_id = store.create_task(
         user_id,
@@ -476,6 +517,7 @@ def _prepare_task(
         resume_version_label=resume_version_label,
         jobs=jobs,
         jd_snapshots=jd_snapshots,
+        project_id=project_id,
     )
 
 
@@ -490,6 +532,7 @@ async def _execute_analysis(
     resume_version_id: str | None = None,
     resume_version_label: str | None = None,
     jd_snapshots: list[dict[str, Any]] | None = None,
+    project_id: str | None = None,
     cancel_check: Any = None,
 ):
     """跑引擎并把成功产物落库；返回 ``AnalysisProject``。
@@ -525,13 +568,38 @@ async def _execute_analysis(
     if cancel_check is not None and cancel_check():
         raise AnalysisCancelled()
 
+    # 更新分析：在原项目上追加版本，不创建独立项目。
+    if project_id:
+        original = store.get_project(user_id, project_id)
+        if original is None:
+            raise AnalysisError(
+                "PROJECT_NOT_FOUND",
+                "指定的分析项目不存在或不属于当前用户",
+                404,
+            )
+        new_result = project.results[0]
+        next_version = max((r.version for r in original.results), default=0) + 1
+        new_result.projectId = original.id
+        new_result.version = next_version
+        project = AnalysisProject(
+            id=original.id,
+            name=original.name,
+            jobs=project.jobs,
+            results=[*original.results, new_result],
+            createdAt=original.createdAt,
+            updatedAt=iso(time.time()),
+        )
+
     # P1-01 / P1-02：把「本次实际使用的简历版本 + JD 原文」绑定到
     # 结果记录上。这些值来自任务创建时的快照，不会再被后续修改影响。
     snapshots_by_raw = {
         (snap.get("rawJd") or "").strip(): snap
         for snap in (jd_snapshots or [])
     }
-    for result in project.results:
+    results_to_bind = project.results
+    if project_id:
+        results_to_bind = project.results[-1:]
+    for result in results_to_bind:
         result.resumeVersionId = resume_version_id
         result.resumeVersionLabel = resume_version_label
         if jd_snapshots:
@@ -641,6 +709,7 @@ async def analyze(
             resume_version_id=prepared.resume_version_id,
             resume_version_label=prepared.resume_version_label,
             jd_snapshots=prepared.jd_snapshots,
+            project_id=prepared.project_id,
         )
     except AnalysisError as exc:
         # P1-2：失败必须落库，消灭「失败无痕」。
@@ -707,6 +776,7 @@ async def start_analysis_task(
                 resume_version_id=prepared.resume_version_id,
                 resume_version_label=prepared.resume_version_label,
                 jd_snapshots=prepared.jd_snapshots,
+                project_id=prepared.project_id,
                 cancel_check=cancel_event.is_set,
             )
         except AnalysisCancelled:

@@ -45,7 +45,7 @@ import time
 from typing import Any, Optional
 
 from app.careerly.capability import SCORING_VERSION
-from app.careerly.schemas import AnalysisProject
+from app.careerly.schemas import AnalysisProject, AnalysisResult
 from app.utils.logger import logger
 
 # Dart enum names (growth_event.dart) — never emit Chinese labels here.
@@ -62,6 +62,16 @@ BASELINE_TITLE = "建立职业基线"
 
 def _fingerprint(value: str) -> str:
     return hashlib.sha256((value or "").encode("utf-8")).hexdigest()[:32]
+
+
+def fingerprint(value: str) -> str:
+    """简历 / JD 原文的稳定指纹（P1-01，公开版本）。
+
+    与快照里 ``resumeFingerprint`` / ``jdHash`` 同一算法 —— 调用方
+    （router 写结果、store 读结果）必须用**同一个**函数，否则两边
+    算出的指纹不同，比较会永远失败。
+    """
+    return _fingerprint(value)
 
 
 def job_key(title: str, company: str) -> str:
@@ -205,6 +215,63 @@ def match_score_comparable(
     prev_resume = prev_scores.get("resumeFingerprint")
     new_resume = new_scores.get("resumeFingerprint")
     return bool(prev_resume) and bool(new_resume) and prev_resume != new_resume
+
+
+def _snapshot_identity(snapshot: Any) -> tuple[str, str] | None:
+    """``(jobKey, jdHash)`` for a saved JD snapshot；不可用时 ``None``。
+
+    缺失原文（历史数据 / ``available=False``）等于**不知道该比较什么**，
+    一律视为不可比较 —— 这比拿当前 ``jobs.raw_jd`` 冒充要诚实。
+    """
+    if snapshot is None or not getattr(snapshot, "available", False):
+        return None
+    raw_jd = (snapshot.rawJd or "").strip()
+    if not raw_jd:
+        return None
+    return job_key(snapshot.title, snapshot.company), _fingerprint(raw_jd)
+
+
+def annotate_match_previous_scores(results: list[AnalysisResult]) -> None:
+    """给每条结果的每个 ``JobMatch`` 填后端确认的 ``previousScore``（P1-01）。
+
+    **唯一的比较口径** —— 前端不再自己拿相邻结果的 ``jobId`` 相减。
+    对结果 ``i`` 的岗位 ``m``，从 ``i-1`` 往前找**最近一条**同时满足
+    下列条件的结果，取其中「同一目标岗位」那一条匹配的分数：
+
+    1. ``scoringVersion`` 两边都有且相等；
+    2. 两份简历的 ``resumeFingerprint`` 都有值且**不同**；
+    3. 目标岗位相同（``jobKey`` —— 岗位名 + 公司名派生，与 job 行 id 无关）；
+    4. JD 原文相同（``jdHash``）。
+
+    条件不满足 → 保持 ``None``，UI 不展示增长数值。没有这些元数据的
+    历史结果永远不可比较，**不伪造**旧数据中不存在的「上次分数」。
+    """
+    for index, result in enumerate(results):
+        if not result.scoringVersion or not result.resumeFingerprint:
+            continue
+        current_snaps = {s.jobId: s for s in result.jobSnapshots}
+        for match in result.matches:
+            identity = _snapshot_identity(current_snaps.get(match.jobId))
+            if identity is None:
+                continue
+            for back in range(index - 1, -1, -1):
+                previous = results[back]
+                if previous.scoringVersion != result.scoringVersion:
+                    continue
+                if (
+                    not previous.resumeFingerprint
+                    or previous.resumeFingerprint == result.resumeFingerprint
+                ):
+                    continue
+                previous_snaps = {s.jobId: s for s in previous.jobSnapshots}
+                found = None
+                for candidate in previous.matches:
+                    if _snapshot_identity(previous_snaps.get(candidate.jobId)) == identity:
+                        found = candidate
+                        break
+                if found is not None:
+                    match.previousScore = found.score
+                    break
 
 
 def diff_snapshots(

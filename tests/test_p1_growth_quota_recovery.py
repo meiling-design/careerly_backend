@@ -24,7 +24,7 @@ import pytest
 from app.careerly import growth
 from app.careerly.capability import SCORING_VERSION
 from app.careerly.engine import build_project
-from app.careerly.schemas import JobSnapshot
+from app.careerly.schemas import AnalysisResult, JobMatch, JobSnapshot
 from app.careerly.store import CareerlyStore
 from app.careerly import store as careerly_store_module
 from app.models.job import JobPosting, JobSource
@@ -160,6 +160,160 @@ def test_first_analysis_still_creates_baseline_event():
     new = _scores(_project(), "简历 V1")
     events = growth.diff_snapshots(None, new, "AI 产品经理", 1.0)
     assert len(events) == 1 and events[0]["type"] == "experience"
+
+
+# ── P1-01：结果页「较上次」只由后端确认可比（annotate_match_previous_scores）──
+
+
+def _result(
+    *,
+    version: int,
+    score: int,
+    resume_fp: str | None,
+    scoring: str | None = SCORING_VERSION,
+    title: str = "AI 产品经理",
+    company: str = "示例公司",
+    raw_jd: str = "JD A",
+    job_id: str | None = None,
+):
+    """一条分析结果 + 一个岗位 + 它的 JD 快照（与 store 读取形态一致）。"""
+    job_id = job_id or f"job-{version}"
+    return AnalysisResult(
+        id=f"res-{version}",
+        projectId="project-1",
+        version=version,
+        matches=[JobMatch(jobId=job_id, score=score, rank=1)],
+        jobSnapshots=[
+            JobSnapshot(jobId=job_id, title=title, company=company, rawJd=raw_jd)
+        ],
+        scoringVersion=scoring,
+        resumeFingerprint=resume_fp,
+    )
+
+
+def test_previous_score_filled_for_same_job_same_jd_different_resume():
+    prev = _result(version=1, score=78, resume_fp=growth.fingerprint("简历 V1"))
+    new = _result(version=2, score=82, resume_fp=growth.fingerprint("简历 V2"))
+    results = [prev, new]
+    growth.annotate_match_previous_scores(results)
+    assert prev.matches[0].previousScore is None
+    assert new.matches[0].previousScore == 78
+
+
+def test_previous_score_hidden_for_different_job():
+    """跨岗位：AI 产品经理 78 → AI 产品运营 82 不是可比的「较上次」。"""
+    prev = _result(
+        version=1, score=78, resume_fp=growth.fingerprint("简历 V1"),
+        title="AI 产品经理",
+    )
+    new = _result(
+        version=2, score=82, resume_fp=growth.fingerprint("简历 V2"),
+        title="AI 产品运营",
+    )
+    growth.annotate_match_previous_scores([prev, new])
+    assert new.matches[0].previousScore is None
+
+
+def test_previous_score_hidden_for_different_jd_content():
+    prev = _result(
+        version=1, score=78, resume_fp=growth.fingerprint("简历 V1"),
+        raw_jd="JD 版本 A",
+    )
+    new = _result(
+        version=2, score=82, resume_fp=growth.fingerprint("简历 V2"),
+        raw_jd="JD 版本 B",
+    )
+    growth.annotate_match_previous_scores([prev, new])
+    assert new.matches[0].previousScore is None
+
+
+def test_previous_score_hidden_for_different_scoring_version():
+    prev = _result(
+        version=1, score=78, resume_fp=growth.fingerprint("简历 V1"),
+        scoring="c4-cap-v0",
+    )
+    new = _result(version=2, score=82, resume_fp=growth.fingerprint("简历 V2"))
+    growth.annotate_match_previous_scores([prev, new])
+    assert new.matches[0].previousScore is None
+
+
+def test_previous_score_hidden_without_resume_change():
+    """同一份简历的分数波动不是成长 —— 不展示「较上次」。"""
+    same = growth.fingerprint("同一份简历")
+    prev = _result(version=1, score=78, resume_fp=same)
+    new = _result(version=2, score=82, resume_fp=same)
+    growth.annotate_match_previous_scores([prev, new])
+    assert new.matches[0].previousScore is None
+
+
+def test_previous_score_hidden_for_legacy_results():
+    """迁移前的历史结果没有评分口径 / 简历指纹 → 不可比较。"""
+    prev = _result(version=1, score=78, resume_fp=None, scoring=None)
+    new = _result(version=2, score=82, resume_fp=None, scoring=None)
+    growth.annotate_match_previous_scores([prev, new])
+    assert new.matches[0].previousScore is None
+
+
+def test_previous_score_ignores_job_row_id_and_uses_job_key_and_jd_hash():
+    """岗位行 id 每次分析都会变，比较必须认 jobKey + jdHash。"""
+    prev = _result(
+        version=1, score=78, resume_fp=growth.fingerprint("简历 V1"),
+        job_id="job-old",
+    )
+    new = _result(
+        version=2, score=82, resume_fp=growth.fingerprint("简历 V2"),
+        job_id="job-new",
+    )
+    growth.annotate_match_previous_scores([prev, new])
+    assert new.matches[0].previousScore == 78
+
+
+def test_previous_score_skips_incomparable_intermediate_result():
+    """跳过不同 JD / 同简历的中间结果，取最近一条**可比**的。"""
+    first = _result(version=1, score=70, resume_fp=growth.fingerprint("简历 V1"))
+    middle = _result(
+        version=2, score=60, resume_fp=growth.fingerprint("简历 V2"),
+        raw_jd="JD 改版",
+    )
+    last = _result(version=3, score=80, resume_fp=growth.fingerprint("简历 V3"))
+    growth.annotate_match_previous_scores([first, middle, last])
+    assert last.matches[0].previousScore == 70
+    assert middle.matches[0].previousScore is None
+
+
+def test_previous_score_per_job_in_multi_job_result():
+    """多岗位结果：只有可比的那个岗位拿到 previousScore。"""
+    prev = AnalysisResult(
+        id="res-1", projectId="project-1", version=1,
+        matches=[
+            JobMatch(jobId="a1", score=78, rank=1),
+            JobMatch(jobId="b1", score=60, rank=2),
+        ],
+        jobSnapshots=[
+            JobSnapshot(jobId="a1", title="岗位 A", company="公司", rawJd="JD A"),
+            JobSnapshot(jobId="b1", title="岗位 B", company="公司", rawJd="JD B"),
+        ],
+        scoringVersion=SCORING_VERSION,
+        resumeFingerprint=growth.fingerprint("简历 V1"),
+    )
+    new = AnalysisResult(
+        id="res-2", projectId="project-1", version=2,
+        matches=[
+            JobMatch(jobId="a2", score=82, rank=1),
+            JobMatch(jobId="b2", score=55, rank=2),
+        ],
+        jobSnapshots=[
+            JobSnapshot(jobId="a2", title="岗位 A", company="公司", rawJd="JD A"),
+            # 岗位 B 的 JD 改写了 → 不可比较。
+            JobSnapshot(jobId="b2", title="岗位 B", company="公司", rawJd="JD B v2"),
+        ],
+        scoringVersion=SCORING_VERSION,
+        resumeFingerprint=growth.fingerprint("简历 V2"),
+    )
+    growth.annotate_match_previous_scores([prev, new])
+    by_job = {m.jobId: m.previousScore for m in new.matches}
+    assert by_job["a2"] == 78
+    assert by_job["b2"] is None
 
 
 # ── P1-04 额度预占 ─────────────────────────────────────────────────────────

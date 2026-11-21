@@ -25,6 +25,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from app.careerly import growth
 from app.careerly.schemas import (
     AnalysisProject,
     AnalysisResult,
@@ -141,6 +142,8 @@ class CareerlyStore:
                 resume_version_id   TEXT,
                 resume_version_label TEXT,
                 capability_snapshot TEXT,
+                scoring_version     TEXT,
+                resume_fingerprint  TEXT,
                 created_at          REAL NOT NULL
             );
 
@@ -344,6 +347,11 @@ class CareerlyStore:
             conn.execute(
                 "ALTER TABLE analysis_results ADD COLUMN resume_version_label TEXT"
             )
+        # P1-01：比较口径随结果一起存。旧行保持 NULL → 不可比较，
+        # 不补造「上次分数」（与 growth 模块的历史快照规则一致）。
+        for column in ("scoring_version", "resume_fingerprint"):
+            if column not in result_columns:
+                conn.execute(f"ALTER TABLE analysis_results ADD COLUMN {column} TEXT")
 
         quota_columns = {
             row["name"]
@@ -393,10 +401,12 @@ class CareerlyStore:
             conn.execute(
                 "INSERT OR REPLACE INTO analysis_results "
                 "(id, project_id, version, resume_version_id, resume_version_label, "
-                " capability_snapshot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " capability_snapshot, scoring_version, resume_fingerprint, "
+                " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (result.id, result.projectId or project.id, result.version,
                  result.resumeVersionId, result.resumeVersionLabel,
                  _j(result.capabilitySnapshot),
+                 result.scoringVersion, result.resumeFingerprint,
                  self._parse_ts(result.createdAt) or now),
             )
             # P1-02：写入本次分析的 JD 快照。``INSERT OR IGNORE`` 而不是
@@ -534,8 +544,15 @@ class CareerlyStore:
                 matches=matches,
                 capabilitySnapshot=_unjson(r["capability_snapshot"], {}),
                 jobSnapshots=snapshots,
+                scoringVersion=r["scoring_version"],
+                resumeFingerprint=r["resume_fingerprint"],
                 createdAt=iso(r["created_at"]),
             ))
+
+        # P1-01：匹配度变化只由后端判定。这里统一按「同一岗位 + 同一 JD +
+        # 不同简历 + 同一评分口径」回填 ``JobMatch.previousScore``，前端
+        # 不再拿相邻结果的 jobId 自行相减。
+        growth.annotate_match_previous_scores(results)
 
         return AnalysisProject(
             id=pid, name=row["name"], jobs=jobs, results=results,

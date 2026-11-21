@@ -52,6 +52,7 @@ from app.core.security import get_current_user
 from app.core.state_store import StateStore
 from app.careerly import assets as career_assets
 from app.careerly import growth, home, identity
+from app.careerly.capability import SCORING_VERSION
 from app.careerly.ai_context import (
     SYSTEM_PROMPT,
     build_current_context,
@@ -599,9 +600,14 @@ async def _execute_analysis(
     results_to_bind = project.results
     if project_id:
         results_to_bind = project.results[-1:]
+    # P1-01：把「评分口径 + 本次简历指纹」写进结果本身。读取时
+    # ``store._load_project`` 用它们判定两次匹配分是否可比 —— 前端
+    # 不参与这个判断。
     for result in results_to_bind:
         result.resumeVersionId = resume_version_id
         result.resumeVersionLabel = resume_version_label
+        result.scoringVersion = SCORING_VERSION
+        result.resumeFingerprint = growth.fingerprint(resume_text)
         if jd_snapshots:
             # 多岗位：快照与 job 一一对应。
             #

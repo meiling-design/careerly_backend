@@ -69,6 +69,13 @@ class JobMatch(BaseModel):
     jobId: str
     score: int = 0
     rank: int = 0
+    #: 后端确认**可比**的上一次匹配分（P1-01）。
+    #:
+    #: 只有同时满足「同一目标岗位（jobKey）+ 同一 JD（jdHash）+
+    #: 不同简历（resumeFingerprint）+ 同一评分口径（scoringVersion）」
+    #: 才会填充；否则保持 ``None``。前端**不得**用相邻结果的分数自行
+    #: 推断差值 —— 不同岗位 / 不同 JD 的分数相减不是成长。
+    previousScore: Optional[int] = None
     strengths: list[str] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
@@ -110,6 +117,13 @@ class AnalysisResult(BaseModel):
     #: 本次分析实际使用的岗位原文快照（P1-02）。历史记录为空 /
     #: ``available=False``，前端据此显示缺失态，**不**读当前岗位。
     jobSnapshots: list[JobSnapshot] = Field(default_factory=list)
+    #: 本次分析的评分口径（P1-01）。比较前必须相等；历史记录为 ``None``
+    #: → 不可比较，不填 ``JobMatch.previousScore``。
+    scoringVersion: Optional[str] = None
+    #: 本次分析实际使用简历的指纹（P1-01）。匹配度变化要求两份简历
+    #: **确实不同**（同一份简历的分数波动不是成长）。历史记录为 ``None``
+    #: → 不可比较。
+    resumeFingerprint: Optional[str] = None
     createdAt: Optional[str] = None
 
 

@@ -207,8 +207,9 @@ def build_project(
 
     ordered = sorted(match_results, key=lambda r: r.score, reverse=True)
     matches = []
+    matched_job_ids: set[str] = set()
     fallback_index = 0
-    for i, r in enumerate(ordered):
+    for r in ordered:
         description = (getattr(getattr(r, "job", None), "description", "") or "").strip()
         job = by_raw.get(description)
         if job is None:
@@ -216,7 +217,14 @@ def build_project(
             # 分配给尚未用过的岗位，保证每条匹配都有可点击的岗位卡。
             job = job_models[min(fallback_index, len(job_models) - 1)]
             fallback_index += 1
-        matches.append(to_job_match(r, job_id=job.id, rank=i + 1))
+        # 一个岗位只允许一条匹配。``job_matches`` 的主键是
+        # ``(result_id, job_id)`` —— 若这里放过重复 jobId，响应里会看到
+        # 两条而落库时后一条静默覆盖前一条，形成「返回与回读不一致」。
+        # 引擎正常情况下已按 JD 去重；这里是持久化前的最后一道闸。
+        if job.id in matched_job_ids:
+            continue
+        matched_job_ids.add(job.id)
+        matches.append(to_job_match(r, job_id=job.id, rank=len(matches) + 1))
 
     result = AnalysisResult(
         id=_new_id("res"),

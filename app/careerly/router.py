@@ -582,10 +582,21 @@ async def _execute_analysis(
         next_version = max((r.version for r in original.results), default=0) + 1
         new_result.projectId = original.id
         new_result.version = next_version
+        # 部分更新（只重跑 A、C）不能把未选的 B 从项目里删掉 —— 更新是
+        # 「在原项目上追加一次重新分析」，不是「用本次选择的岗位重建项目」。
+        # 保留原岗位顺序，用本次新实体替换同 id 的岗位，再追加新岗位。
+        updated_by_id = {job.id: job for job in project.jobs}
+        original_ids = {job.id for job in original.jobs}
+        merged_jobs = [
+            updated_by_id.get(job.id, job) for job in original.jobs
+        ]
+        merged_jobs.extend(
+            job for job in project.jobs if job.id not in original_ids
+        )
         project = AnalysisProject(
             id=original.id,
             name=original.name,
-            jobs=project.jobs,
+            jobs=merged_jobs,
             results=[*original.results, new_result],
             createdAt=original.createdAt,
             updatedAt=iso(time.time()),
@@ -637,6 +648,10 @@ async def _execute_analysis(
             ]
 
     store.save_project(user_id, project)
+    # ``_load_project`` 在读取时回填 ``previousScore``；但 POST 的响应
+    # 直接返回内存里的 project —— 不在这里补一次，更新后的首屏就会
+    # 少掉「较上次 ±」，与随后 GET 回读的结果不一致。
+    growth.annotate_match_previous_scores(project.results)
     # P3-1：把引擎解析出的简历画像落库 —— 这是「我的 → 职业资产」的真实数据源。
     # 在此之前 careerly_resumes.profile 永远是 {}，职业资产页只能走 Mock。
     # ⚠️ 只在画像非空时写：分析链路可能降级产出 {}，用空值覆盖已有画像

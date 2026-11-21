@@ -37,3 +37,28 @@ AI 消息任务表 / 预占状态，属于独立设计，不适合塞进分析�
 
 见 `app/careerly/store.py::recover_interrupted_tasks` 与
 `tests/test_p1_growth_quota_recovery.py`。
+
+## F3 — 匹配层同义词测试红灯（既有失败，2026-11-21 登记）
+
+**状态**：已确认存在，**未修复**；与 Careerly P1/Phase A 改动无关。
+
+**证据**
+
+- `tests/test_matching.py::TestSkillOverlap::test_skill_synonyms` 失败：
+  断言 `K8s → Kubernetes`、`Python3.8 → Python` 等同义词应命中，实际
+  `matched` 为空。
+- `app/agents/matching_agent.py::_skill_overlap`（约 :438）只做
+  「小写精确匹配 + 子串加分」，**从未实现同义词映射** —— 测试描述的
+  是一个未实现的能力，不是本批次引入的回归。
+- 2026-11-21 全量回归：`1 failed, 284 passed`，唯一失败即此条。
+
+**为什么本批次不修**
+
+同义词映射会改变**全线匹配评分语义**（包括 Careerly 的岗位分数与排名），
+不只是让一条测试变绿。需要先定义词表来源、匹配粒度与权重，属于独立设计；
+验收任务不应顺手扩大修改范围。
+
+**建议修复方向**
+
+引入显式的技能同义词表（可配置、可测试），在 `_skill_overlap` 内先归一化
+再比对；同时补充「词表未命中不降分」的回归用例，避免评分整体漂移。
